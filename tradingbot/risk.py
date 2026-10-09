@@ -170,9 +170,11 @@ class RiskManager:
             self._peak_equity = float(equity)
         dd = self.drawdown()
         max_dd = self.config.max_drawdown
+        # INFO et non WARNING : en backtest / walk-forward ces événements sont simulés des
+        # centaines de fois ; en live, LiveTrader avertit et notifie lui-même l'utilisateur.
         if max_dd and dd > max_dd and not self._kill_switch:
             self._kill_switch = True
-            logger.warning(
+            logger.info(
                 "Kill switch déclenché à %s : drawdown %.2f %% > %.2f %%",
                 ts.isoformat(),
                 dd * 100,
@@ -180,7 +182,7 @@ class RiskManager:
             )
         if self._daily_loss(equity) > (self.config.daily_loss_limit or math.inf):
             if not self._daily_locked:
-                logger.warning(
+                logger.info(
                     "Limite de perte journalière atteinte à %s (%.2f %%)",
                     ts.isoformat(),
                     self._daily_loss(equity) * 100,
@@ -223,12 +225,12 @@ class RiskManager:
             return False, "aucune position demandée (signal plat)"
         if side < 0 and not self.config.allow_short:
             return False, "vente à découvert désactivée (allow_short = false)"
+        if _is_bad(equity) or equity <= 0:
+            return False, "équité nulle ou négative"
         if self._kill_switch:
             return False, "kill switch actif : drawdown maximal dépassé"
         if self.daily_limit_hit(timestamp, equity):
             return False, "limite de perte journalière atteinte, reprise au prochain jour UTC"
-        if _is_bad(equity) or equity <= 0:
-            return False, "équité nulle ou négative"
         return True, "ok"
 
     def reset_daily(self, timestamp: Any, equity: float | None = None) -> None:

@@ -43,9 +43,26 @@ rolling_volatility(series, window=20, periods_per_year=None) -> Series  # écart
                                                              # des rendements log,
                                                              # annualisé si demandé
 returns(series, log=False) -> Series
-crossover(a, b) -> Series[bool]   # True à la bougie où a passe au-dessus de b
-crossunder(a, b) -> Series[bool]
+true_range(df) -> Series                          # brique de atr / adx
+wilder_smooth(series, window) -> Series           # lissage Wilder (ewm alpha=1/window)
+crossover(a, b) -> Series[bool]   # True à la bougie où a passe au-dessus de b ;
+crossunder(a, b) -> Series[bool]  # b : Series ou scalaire (ex. crossunder(rsi, 30))
 ```
+
+## `tradingbot/strategies/`
+
+`base.py` : contrat `Strategy` (déjà écrit, ne pas modifier sans mettre à jour ce doc).
+Registre dans `__init__.py` :
+
+```python
+STRATEGIES: dict[str, type[Strategy]]        # clé = Strategy.name
+register(cls) -> cls                         # décorateur ; ValueError si nom absent/dupliqué
+get_strategy(name, **params) -> Strategy     # KeyError (avec la liste des noms) si inconnue
+list_strategies() -> list[tuple[str, str]]   # (nom, description) trié par nom
+```
+
+Stratégies livrées : `sma_cross`, `ema_trend`, `rsi_reversion`, `bollinger_reversion`,
+`donchian_breakout` (détails pour débutant dans `docs/STRATEGIES.md`).
 
 ## `tradingbot/data/`
 
@@ -59,13 +76,17 @@ load_csv(path) -> DataFrame             # CSV avec date en 1re colonne ou colonn
                                         # timestamp/date/time (ISO ou epoch ms/s)
 save_csv(df, path) -> None
 fetch_ohlcv(exchange_id, symbol, timeframe, since=None, until=None, limit=None,
-            exchange=None) -> DataFrame # pagination ccxt ; `exchange` injectable
+            exchange=None, *, drop_last_incomplete=True, page_size=1000,
+            sleep=time.sleep, now_ms=None) -> DataFrame
+                                        # pagination ccxt ; `exchange` injectable
                                         # (objet avec .fetch_ohlcv/.parse8601/.rateLimit)
                                         # pour les tests ; ne retourne que des bougies
-                                        # CLÔTURÉES si drop_last_incomplete=True (défaut)
+                                        # CLÔTURÉES si drop_last_incomplete=True (défaut) ;
+                                        # `sleep` / `now_ms` injectables (tests sans attente)
 cache_path(cache_dir, exchange_id, symbol, timeframe) -> Path
 load_or_fetch(exchange_id, symbol, timeframe, since=None, cache_dir="data/cache",
-              refresh=False, exchange=None) -> DataFrame
+              refresh=False, exchange=None, **fetch_kwargs) -> DataFrame
+                                        # fetch_kwargs transmis à fetch_ohlcv (ex. until=)
 timeframe_to_timedelta(tf) -> pd.Timedelta        # "1h" -> 1 heure ; lève ValueError
 infer_periods_per_year(index) -> float            # 1h -> 8760, 1d -> 365 (crypto 24/7)
 resample_ohlcv(df, rule) -> DataFrame             # ex. "4h"
@@ -75,7 +96,8 @@ resample_ohlcv(df, rule) -> DataFrame             # ex. "4h"
 
 ```python
 generate_ohlcv(n=2000, seed=0, start="2022-01-01", freq="1h", start_price=100.0,
-               regimes=None, vol=0.01) -> DataFrame
+               regimes=None, vol=0.01) -> DataFrame   # seed=None → non reproductible
+default_regimes(n, vol) -> list[Regime]               # Regime = (n_bars, drift, vol)
 # regimes : liste de (n_bars, drift_par_bar, vol_par_bar) enchaînés ; par défaut un mélange
 # haussier / baissier / latéral. Résultat cohérent : low <= min(open, close),
 # high >= max(open, close), volume > 0.
@@ -88,8 +110,8 @@ generate_ohlcv(n=2000, seed=0, start="2022-01-01", freq="1h", start_price=100.0,
 class RiskConfig:
     risk_per_trade: float = 0.01        # fraction du capital perdue si le stop est touché
     max_position_fraction: float = 0.95 # notionnel max / équité
-    max_drawdown: float = 0.20          # 0 ou None = désactivé
-    daily_loss_limit: float = 0.05      # 0 ou None = désactivé
+    max_drawdown: float | None = 0.20   # 0 ou None = désactivé
+    daily_loss_limit: float | None = 0.05  # 0 ou None = désactivé
     allow_short: bool = False
     min_trade_notional: float = 10.0    # en dessous, on ne trade pas (ex. 10 USDT)
     vol_target: float | None = None     # volatilité annualisée cible (ex. 0.20) ; si
@@ -97,19 +119,26 @@ class RiskConfig:
                                         # vol_target / vol_réalisée (plafonnée à 1 levier)
 
 class RiskManager:
-    def __init__(self, config: RiskConfig): ...
+    def __init__(self, config: RiskConfig | None = None): ...   # None → RiskConfig()
     def position_size(self, equity, price, stop_price=None, realized_vol=None) -> float:
         # unités de l'actif. Si stop_price : size = equity*risk_per_trade/|price-stop|.
         # Sinon : size = equity*max_position_fraction/price. Toujours plafonné par
         # max_position_fraction et par min_trade_notional (→ 0.0 si trop petit).
-    def update(self, timestamp, equity) -> None     # alimente peak, equity du jour
+    def update(self, timestamp, equity) -> None     # alimente peak, equity du jour ;
+                                                    # kill switch / limite journalière
+                                                    # journalisés en INFO (simulés des
+                                                    # centaines de fois en backtest ; le
+                                                    # LiveTrader avertit et notifie)
+    def drawdown(self) -> float                     # fraction positive depuis le plus haut
     def kill_switch_active(self) -> bool            # drawdown > max_drawdown
     def daily_limit_hit(self, timestamp, equity) -> bool
     def can_open(self, side: int, timestamp, equity) -> tuple[bool, str]
         # (autorisé, raison) ; short refusé si not allow_short ; refusé si kill switch /
         # limite journalière
-    def reset_daily(self, timestamp) -> None
+    def reset_daily(self, timestamp, equity=None) -> None
+    def reset(self) -> None                         # remise à zéro complète
     def state(self) -> dict / load_state(d)         # sérialisable JSON
+    peak_equity / day_start_equity                  # propriétés (None avant le 1er update)
 ```
 
 ## `tradingbot/backtest/`
@@ -145,6 +174,7 @@ class BacktestResult:
     trades: pd.DataFrame       # une ligne par Trade (colonnes = champs de Trade)
     metrics: dict[str, float]  # cf. metrics.compute_metrics
     signals: pd.DataFrame      # signaux bruts de la stratégie
+    periods_per_year: float = 365.0   # déduit de l'index (infer_periods_per_year)
     def summary(self) -> str   # tableau texte en français
 
 def run_backtest(df, strategy, config=None, risk=None) -> BacktestResult
@@ -171,15 +201,19 @@ Règles du moteur (boucle bougie par bougie, en numpy pour la vitesse) :
 ### `metrics.py`
 
 ```python
-compute_metrics(equity, trades, periods_per_year, risk_free=0.0, benchmark=None) -> dict
+compute_metrics(equity, trades, periods_per_year, risk_free=0.0, benchmark=None,
+                positions=None) -> dict
 # clés : total_return, cagr, annual_volatility, sharpe, sortino, max_drawdown (négatif,
 # ex. -0.23), max_drawdown_duration (en bougies), calmar, n_trades, win_rate,
 # profit_factor, avg_trade_pct, avg_win_pct, avg_loss_pct, best_trade_pct,
-# worst_trade_pct, avg_bars_held, exposure (fraction des bougies en position),
-# buy_hold_return (si benchmark = série de prix fournie), final_equity
+# worst_trade_pct, avg_bars_held, exposure (fraction des bougies en position, d'après
+# `positions`), buy_hold_return (si benchmark = série de prix fournie), final_equity
 drawdown_series(equity) -> Series
 sharpe_ratio(returns, periods_per_year, risk_free=0.0) -> float   # 0.0 si vol nulle
-sortino_ratio(...), cagr(equity, periods_per_year), max_drawdown(equity)
+sortino_ratio(...), cagr(equity, periods_per_year), max_drawdown(equity),
+max_drawdown_duration(equity) -> int, annual_volatility(returns, periods_per_year),
+calmar_ratio(cagr_value, max_dd), win_rate(trades), profit_factor(trades),
+exposure(positions)
 ```
 
 ### `walkforward.py`
@@ -187,15 +221,22 @@ sortino_ratio(...), cagr(equity, periods_per_year), max_drawdown(equity)
 ```python
 grid_search(df, strategy_cls, grid=None, config=None, risk=None, metric="sharpe",
             max_combinations=200) -> pd.DataFrame   # une ligne par combinaison, triée
-walk_forward(df, strategy_cls, grid=None, train_bars=..., test_bars=..., config=None,
-             risk=None, metric="sharpe", anchored=False) -> WalkForwardResult
+default_windows(n_bars, n_windows=4, train_test_ratio=3) -> (train_bars, test_bars)
+walk_forward(df, strategy_cls, grid=None, train_bars=None, test_bars=None, config=None,
+             risk=None, metric="sharpe", anchored=False, max_combinations=200)
+             -> WalkForwardResult      # train/test None → default_windows(len(df))
 @dataclass
 class WalkForwardResult:
-    windows: list[dict]        # {train_start, train_end, test_start, test_end,
-                               #  best_params, is_metric, oos_metric}
+    windows: list[dict]        # {window, train_start, train_end, test_start, test_end,
+                               #  best_params, is_metric, oos_metric, n_test_bars,
+                               #  n_oos_trades, oos_return} (bornes = indices de bougies)
     oos_equity: pd.Series      # équité OOS recomposée (chaînage des rendements)
     oos_metrics: dict
     is_metrics_mean: float ; oos_metrics_mean: float ; overfit_ratio: float
+    strategy_name: str ; metric: str ; train_bars: int ; test_bars: int ; anchored: bool
+    oos_returns: pd.Series ; oos_positions: pd.Series ; oos_trades: pd.DataFrame
+    periods_per_year: float
+    n_windows -> int (propriété) ; windows_frame() -> pd.DataFrame  # une ligne par fenêtre
     def summary(self) -> str
 ```
 
@@ -203,9 +244,12 @@ class WalkForwardResult:
 
 ```python
 format_report(result: BacktestResult, benchmark_return=None) -> str   # texte FR
-format_comparison(results: list[BacktestResult]) -> str               # tableau
+format_comparison(results: list[BacktestResult], benchmark=None) -> str  # tableau ;
+                                            # benchmark = série de prix (close) → ligne
+                                            # « Buy & hold » sur la même période
 save_report(result, out_dir) -> list[Path]  # equity.csv, trades.csv, summary.txt,
-                                            # equity.png si matplotlib installé
+                                            # metrics.json, equity.png si matplotlib
+                                            # installé (sinon avertissement journalisé)
 plot_result(result, path) -> Path | None    # import matplotlib paresseux ; None sinon
 ```
 
@@ -213,11 +257,13 @@ plot_result(result, path) -> Path | None    # import matplotlib paresseux ; None
 
 - `broker.py` : contrat (déjà écrit, ne pas modifier sans mettre à jour ce doc).
 - `paper.py` : `PaperBroker(initial_cash, fee_rate=0.001, slippage=0.0005,
-  price_feed: Callable[[str], float], state_path: str | Path | None = None)`.
-  Exécution immédiate au prix `price_feed(symbol)` ± slippage ; refuse (BrokerError)
-  un achat dépassant le cash ou une vente à découvert si `allow_short=False`.
-  Journal des ordres `self.orders: list[Order]`. État persistant JSON (`save()`,
-  `load()` automatique à l'init si le fichier existe).
+  price_feed: Callable[[str], float] | None = None, state_path: str | Path | None = None,
+  allow_short=False)`.
+  Exécution immédiate au prix `price_feed(symbol)` ± slippage (ou au dernier prix fixé
+  par `set_price(symbol, price)` sans `price_feed`) ; refuse (BrokerError) un achat
+  dépassant le cash ou une vente à découvert si `allow_short=False`.
+  Journal des ordres `self.orders: list[Order]`. État persistant JSON (`state()`,
+  `load_state(d)`, `save()`, `load()` automatique à l'init si le fichier existe, `reset()`).
 - `ccxt_broker.py` : `CcxtBroker(exchange_id, api_key, api_secret, sandbox=False,
   confirm_live=False, exchange=None)`. **Lève `BrokerError` à l'init si
   `confirm_live` est False** (double sécurité avec la CLI). Ordres `create_order(
@@ -233,22 +279,32 @@ plot_result(result, path) -> Path | None    # import matplotlib paresseux ; None
 class LiveTrader:
     def __init__(self, strategy, broker, symbol, timeframe, risk: RiskManager,
                  data_source: Callable[[int], pd.DataFrame],  # n_bars -> OHLCV clôturées
-                 state_dir="state", lookback=500, notifier=None, allow_short=False)
+                 state_dir="state", lookback=500, notifier=None, allow_short=False,
+                 sleep=time.sleep, clock=None)   # sleep / clock injectables (tests)
     def step(self, now=None) -> dict   # une itération : fetch, signal sur la DERNIÈRE
                                        # bougie CLÔTURÉE, risk check, rebalance ; retourne
-                                       # un dict d'état {"timestamp", "signal", "action",
-                                       # "position", "equity", "reason"} ; idempotent :
-                                       # ne re-traite pas une bougie déjà traitée
-                                       # (mémorisé dans state_dir/last_bar.json)
+                                       # un dict d'état {"timestamp", "now", "symbol",
+                                       # "signal", "action", "position", "amount",
+                                       # "entry_price", "stop_loss", "take_profit",
+                                       # "price", "equity", "reason", "order"} ;
+                                       # idempotent : ne re-traite pas une bougie déjà
+                                       # traitée (mémorisée dans state_dir/last_bar.json)
     def run(self, poll_seconds=None, max_iterations=None) -> None  # boucle, Ctrl-C propre
 ```
 
-  Chaque action (entrée, sortie, refus par le risk manager) est loggée et envoyée au
-  `notifier` s'il existe. Le `LiveTrader` gère les stops lui-même entre deux bougies :
-  à chaque `step`, si le prix courant franchit le stop actif → clôture.
-- `notifier.py` : `Notifier` (interface `send(text)`), `LogNotifier`,
-  `TelegramNotifier(token, chat_id, session=None)` (requests injectable, timeouts, jamais
-  d'exception propagée : une notification qui échoue ne doit pas arrêter le bot).
+  `action` ∈ {`open`, `close`, `reverse`, `hold`, `skip`, `stop_loss`, `take_profit`,
+  `kill_switch`, `daily_limit`, `refused`, `error`}. Fichiers d'état dans `state_dir` :
+  `last_bar.json`, `position.json` (côté, taille, prix d'entrée, stop, objectif) et
+  `risk.json` (état du `RiskManager`, pour qu'un redémarrage ne remette pas le kill
+  switch à zéro). Chaque action (entrée, sortie, refus par le risk manager) est loggée
+  et envoyée au `notifier` s'il existe. Le `LiveTrader` gère les stops lui-même entre
+  deux bougies : à chaque `step`, si le prix courant franchit le stop actif → clôture.
+  `poll_seconds=None` → `default_poll_seconds(timeframe)` (durée de bougie / 12, ≥ 10 s).
+- `notifier.py` : `Notifier` (interface `send(text) -> bool`),
+  `LogNotifier(level=logging.INFO, logger_name=None)`, `MultiNotifier(notifiers)` (diffuse
+  à plusieurs), `TelegramNotifier(token, chat_id, session=None, timeout=10.0)` (session
+  type `requests` injectable, `urllib` par défaut, timeouts, jamais d'exception
+  propagée : une notification qui échoue ne doit pas arrêter le bot).
 
 ## `tradingbot/config.py`
 
@@ -257,13 +313,18 @@ class LiveTrader:
 class Settings:  # miroir de config.example.toml, avec sous-dataclasses
     general: GeneralSettings ; strategy: StrategySettings ; risk: RiskConfig ;
     costs: CostSettings ; notifications: NotificationSettings
+    initial_cash: float = 1000.0          # [risk] initial_cash (hors RiskConfig)
     api_key: str | None ; api_secret: str | None ; telegram_token/chat_id
+    is_live / has_api_keys / has_telegram # propriétés ; to_dict() masque les secrets
 
 load_settings(path="config.toml", env=None) -> Settings   # TOML via tomllib ; valeurs
                                                           # manquantes = défauts ;
                                                           # lit `.env` (format KEY=VALUE)
                                                           # puis os.environ (prioritaire)
 load_dotenv(path=".env") -> dict[str, str]                # sans dépendance externe
+parse_param_overrides(items) -> dict[str, Any]            # ["fast=10", "x=1.5"] → dict ;
+                                                          # ValueError si format invalide
+parse_scalar(text) -> Any                                 # "10"→10, "1.5"→1.5, "true"→True
 ```
 
 ## `tradingbot/cli.py`
@@ -273,16 +334,28 @@ Toutes les sorties utilisateur en français, `argparse`, code de sortie ≠ 0 en
 
 | Commande | Rôle |
 |---|---|
-| `list-strategies` | nom + description de chaque stratégie |
-| `demo` | backtest sur données synthétiques, sans réseau (premier contact) |
-| `download --exchange --symbol --timeframe [--since] [--out]` | télécharge et met en cache |
-| `backtest --strategy S (--data fichier.csv \| --exchange E --symbol X --timeframe T) [--param k=v ...] [--report-dir]` | backtest + rapport |
-| `compare (--data ...)` | toutes les stratégies vs buy & hold |
-| `optimize --strategy S ... [--train-bars --test-bars --metric]` | walk-forward |
-| `paper --strategy S --exchange --symbol --timeframe [--once] [--poll]` | paper trading temps réel sur données publiques |
-| `live ... --i-understand-the-risks` | trading réel ; exige `mode = "live"` dans config.toml, le flag, et les clés dans `.env` ; affiche un récapitulatif et demande de taper `OUI` |
+| `list-strategies` | nom, description et paramètres par défaut de chaque stratégie |
+| `demo [--bars 3000] [--seed 42] [--report-dir]` | backtest de toutes les stratégies sur données synthétiques, sans réseau (premier contact) |
+| `download [--exchange --symbol --timeframe] [--since --until] [--out] [--cache-dir --refresh]` | télécharge et met en cache |
+| `backtest --strategy S (--data fichier.csv \| --exchange E --symbol X --timeframe T [--since]) [--param k=v ...] [--initial-cash --fee --slippage --allow-short] [--report-dir]` | backtest + rapport |
+| `compare (--data ... \| --exchange ...) [--strategies a,b] [--report-dir]` | toutes les stratégies vs buy & hold |
+| `optimize --strategy S ... [--train-bars --test-bars --metric --anchored --max-combinations] [--report-dir]` | walk-forward (fenêtres par défaut : `default_windows`) |
+| `paper [--strategy S --exchange --symbol --timeframe] [--once] [--poll] [--lookback --state-dir --max-iterations] [--initial-cash --fee --slippage]` | paper trading temps réel sur données publiques |
+| `live ... --i-understand-the-risks [--yes] [--sandbox]` | trading réel ; exige `mode = "live"` dans config.toml, le flag, et les clés dans `.env` ; affiche un récapitulatif et demande de taper `OUI` |
 
-`--param` accepte `k=v` avec conversion automatique int/float/bool.
+Options communes : `--config` (défaut `config.toml`, facultatif : valeurs par défaut s'il
+n'existe pas) et `--log-level`. `--exchange/--symbol/--timeframe/--strategy` retombent sur
+`config.toml` quand ils sont omis ; `--param` accepte `k=v` avec conversion automatique
+int/float/bool et surcharge `[strategy.params]`.
+
+Codes de sortie : `0` succès, `1` erreur (fichier introuvable, stratégie inconnue,
+`BrokerError`…), `2` refus de sécurité de `live` ou arguments invalides, `130` Ctrl-C.
+Journalisation du paquet sur stderr (niveau par défaut `warning` hors ligne, `info` pour
+`download`/`paper`/`live`) ; hors ligne, un message identique n'est affiché qu'une fois.
+
+Fichiers d'état : compte paper `<state_dir>/paper_<exchange>_<symbole>.json` ; boucle
+`<state_dir>/<paper|sandbox|live>/<exchange>_<symbole>_<timeframe>/` (`last_bar.json`,
+`position.json`, `risk.json`), afin que paper, testnet et réel ne se mélangent jamais.
 
 ## Tests
 

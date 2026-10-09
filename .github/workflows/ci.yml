@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Installation du paquet et des outils de développement
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff check)
+        run: ruff check .
+
+      - name: Formatage (ruff format --check)
+        run: ruff format --check .
+
+      - name: Tests (pytest, sans réseau)
+        run: python -m pytest
+
+      - name: Démo (données synthétiques, sans réseau)
+        run: python -m tradingbot demo --bars 600

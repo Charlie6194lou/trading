@@ -77,6 +77,16 @@ _TIME_ALIASES: tuple[str, ...] = (
 _IGNORED_ALIASES: frozenset[str] = frozenset({"adj_close", "adjclose", "adj._close"})
 
 _TIMEFRAME_RE = re.compile(r"^\s*(\d+)\s*([mhdwHDW])\s*$")
+# unité de timeframe -> alias d'offset pandas pour `resample` (semaines calées sur le lundi)
+_RESAMPLE_ALIASES: dict[str, str] = {
+    "m": "min",
+    "h": "h",
+    "H": "h",
+    "d": "D",
+    "D": "D",
+    "w": "W-MON",
+    "W": "W-MON",
+}
 _TIMEFRAME_UNITS: dict[str, str] = {
     "m": "minutes",
     "h": "hours",
@@ -89,6 +99,10 @@ _TIMEFRAME_UNITS: dict[str, str] = {
 
 _EPOCH_MS = pd.Timestamp(0, tz="UTC")
 _MS = pd.Timedelta(milliseconds=1)
+#: résolution par défaut des DatetimeIndex de la version de pandas installée
+#: ("ns" avec pandas 2.x, "us" avec pandas 3) : les horodatages analysés l'adoptent, pour
+#: être identiques à ceux de ``pd.date_range`` ; un DatetimeIndex fourni garde sa résolution.
+_DEFAULT_UNIT: str = pd.DatetimeIndex(["2000-01-01"]).unit
 
 
 # --- normalisation ------------------------------------------------------------------
@@ -115,11 +129,13 @@ def _epoch_unit(values: np.ndarray) -> str:
 
 
 def _parse_timestamps(values: Any, *, source: str) -> pd.DatetimeIndex:
-    """Convertit une colonne / un index quelconque en ``DatetimeIndex`` UTC (ns).
+    """Convertit une colonne / un index quelconque en ``DatetimeIndex`` UTC.
 
     Accepte : datetimes (naïfs = UTC, tz-aware convertis), entiers epoch en secondes,
     millisecondes, microsecondes ou nanosecondes (unité devinée), chaînes ISO 8601 ou
-    chaînes de chiffres (epoch). Lève ``ValueError`` si rien ne convient.
+    chaînes de chiffres (epoch). Lève ``ValueError`` si rien ne convient. Un
+    ``DatetimeIndex`` fourni garde sa résolution ; les valeurs analysées prennent la
+    résolution par défaut de pandas (``_DEFAULT_UNIT``).
     """
     if isinstance(values, pd.Index):
         arr = values
@@ -151,12 +167,13 @@ def _parse_timestamps(values: Any, *, source: str) -> pd.DatetimeIndex:
             f"Impossible d'interpréter {source} comme des dates/heures : {exc}"
         ) from exc
 
+    keep_unit = isinstance(arr, pd.DatetimeIndex)
     parsed = pd.DatetimeIndex(parsed)
     if parsed.tz is None:
         parsed = parsed.tz_localize("UTC")
     else:
         parsed = parsed.tz_convert("UTC")
-    return parsed.as_unit("ns")
+    return parsed if keep_unit else parsed.as_unit(_DEFAULT_UNIT)
 
 
 def _try_parse_timestamps(values: Any, *, source: str) -> pd.DatetimeIndex | None:
@@ -295,24 +312,48 @@ def ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     out = out.sort_index(kind="stable")
     duplicated = out.index.duplicated(keep="last")
     if duplicated.any():
-        logger.warning("ensure_ohlcv : %d horodatage(s) en double supprimé(s).", int(duplicated.sum()))
+        logger.warning(
+            "ensure_ohlcv : %d horodatage(s) en double supprimé(s).", int(duplicated.sum())
+        )
         out = out.loc[~duplicated]
 
     if len(out) == 0:
-        raise ValueError("Le DataFrame de bougies est vide après nettoyage (dates ou prix invalides).")
+        raise ValueError(
+            "Le DataFrame de bougies est vide après nettoyage (dates ou prix invalides)."
+        )
 
     incoherent = int(((out["high"] < out["low"]).to_numpy()).sum())
     if incoherent:
         logger.warning("ensure_ohlcv : %d bougie(s) avec high < low.", incoherent)
 
     out = out.loc[:, list(OHLCV_COLUMNS)]
+    out.index = _with_inferred_freq(out.index)
     out.index.name = INDEX_NAME
     return out
 
 
+def _with_inferred_freq(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Renseigne ``index.freq`` quand l'index est parfaitement régulier (ex. ``"h"``), pour
+    qu'un aller-retour CSV redonne un index identique à celui de ``pd.date_range``."""
+    if index.freq is not None or len(index) < 3:
+        return index
+    try:
+        inferred = pd.infer_freq(index)
+    except (ValueError, TypeError):
+        return index
+    if inferred is None:
+        return index
+    new_index = index.copy()
+    try:
+        new_index.freq = inferred
+    except (ValueError, TypeError):
+        return index
+    return new_index
+
+
 def _empty_ohlcv() -> pd.DataFrame:
     """DataFrame OHLCV vide mais au bon format (utile quand un téléchargement ne renvoie rien)."""
-    index = pd.DatetimeIndex([], tz="UTC", name=INDEX_NAME).as_unit("ns")
+    index = pd.DatetimeIndex([], tz="UTC", name=INDEX_NAME).as_unit(_DEFAULT_UNIT)
     return pd.DataFrame({c: pd.Series(dtype="float64") for c in OHLCV_COLUMNS}, index=index)
 
 
@@ -344,14 +385,16 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     if len(raw) == 0:
         raise ValueError(f"Le fichier CSV {path} ne contient aucune bougie.")
     df = ensure_ohlcv(raw)
-    logger.info("%d bougies chargées depuis %s (%s -> %s)", len(df), path, df.index[0], df.index[-1])
+    logger.info(
+        "%d bougies chargées depuis %s (%s -> %s)", len(df), path, df.index[0], df.index[-1]
+    )
     return df
 
 
 def _iso_strings(index: pd.DatetimeIndex) -> pd.Index:
     """Horodatages ISO 8601 (``2024-01-01T00:00:00+00:00``), exacts même avec fractions."""
-    idx = index.tz_convert("UTC").as_unit("ns")
-    if (idx.asi8 % 1_000_000_000 == 0).all():
+    idx = index.tz_convert("UTC")
+    if bool((idx == idx.floor("s")).all()):
         return idx.strftime("%Y-%m-%dT%H:%M:%S") + "+00:00"
     return pd.Index([ts.isoformat() for ts in idx])
 
@@ -411,7 +454,9 @@ def infer_periods_per_year(index: pd.Index | pd.Series | pd.DataFrame) -> float:
         try:
             index = pd.DatetimeIndex(index)
         except (ValueError, TypeError) as exc:
-            raise TypeError("`index` doit être un DatetimeIndex (ou un objet qui en porte un).") from exc
+            raise TypeError(
+                "`index` doit être un DatetimeIndex (ou un objet qui en porte un)."
+            ) from exc
     if len(index) < 2:
         logger.debug("infer_periods_per_year : index trop court, valeur par défaut 365.")
         return 365.0
@@ -435,16 +480,27 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     kwargs: dict[str, Any] = {"closed": "left", "label": "left"}
     match = _TIMEFRAME_RE.match(rule) if isinstance(rule, str) else None
-    if match is not None and match.group(2) in ("w", "W"):
-        resampler = data.resample(f"{int(match.group(1))}W-MON", **kwargs)
-    elif match is not None:
-        resampler = data.resample(timeframe_to_timedelta(rule), origin="epoch", **kwargs)
+    if match is not None:
+        count = int(match.group(1))
+        if count <= 0:
+            raise ValueError(f"Timeframe invalide : {rule!r} (le nombre doit être >= 1).")
+        alias = _RESAMPLE_ALIASES[match.group(2)]
+        # alias pandas plutôt que Timedelta : même `freq` que celle déduite par pd.infer_freq.
+        # `origin="epoch"` cale les intervalles intra-journaliers sur minuit UTC ; les
+        # jours / semaines y sont déjà alignés (et pandas refuse `origin` pour eux).
+        if alias in ("min", "h"):
+            kwargs["origin"] = "epoch"
+        resampler = data.resample(f"{count}{alias}", **kwargs)
     else:
         resampler = data.resample(rule, **kwargs)
     out = resampler.agg(agg)
     out = out.loc[out["open"].notna()]
     out = out.astype("float64")
-    out.index = pd.DatetimeIndex(out.index).tz_convert("UTC").as_unit("ns")
+    index = pd.DatetimeIndex(out.index).tz_convert("UTC")
+    index.freq = (
+        None  # on ne garde que la fréquence réellement observée après suppression des trous
+    )
+    out.index = _with_inferred_freq(index)
     out.index.name = INDEX_NAME
     return out.loc[:, list(OHLCV_COLUMNS)]
 
@@ -476,7 +532,9 @@ def _to_ms(value: Any, exchange: Any = None) -> int | None:
         try:
             ts = pd.Timestamp(value)
         except (ValueError, TypeError) as exc:
-            raise ValueError(f"Date invalide : {value!r} (attendu ISO 8601, ex. 2024-01-01).") from exc
+            raise ValueError(
+                f"Date invalide : {value!r} (attendu ISO 8601, ex. 2024-01-01)."
+            ) from exc
     elif isinstance(value, pd.Timestamp):
         ts = value
     elif isinstance(value, datetime):
@@ -494,7 +552,9 @@ def _build_exchange(exchange_id: str) -> Any:
     try:
         import ccxt
     except ImportError as exc:  # pragma: no cover - dépendance déclarée
-        raise ImportError("La bibliothèque `ccxt` est requise pour télécharger des données.") from exc
+        raise ImportError(
+            "La bibliothèque `ccxt` est requise pour télécharger des données."
+        ) from exc
     cls = getattr(ccxt, exchange_id, None)
     if cls is None or not isinstance(cls, type):
         raise ValueError(

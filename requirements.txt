@@ -1,0 +1,14 @@
+# Miroir des dépendances de pyproject.toml (`pip install -r requirements.txt`).
+# Préférez `pip install -e ".[dev]"`, qui installe aussi la commande `tradingbot`.
+
+# Dépendances du robot
+pandas>=2.2
+numpy>=1.26
+ccxt>=4.4
+
+# Outils de développement (optionnels pour faire tourner le robot)
+pytest>=8
+ruff>=0.5
+
+# Optionnel : graphiques des rapports (equity.png)
+# matplotlib>=3.8

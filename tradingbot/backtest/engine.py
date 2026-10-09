@@ -523,7 +523,11 @@ def run_backtest(
                     extreme = exec_price
                     if trail_pct is not None:
                         cand = exec_price * (1.0 - side * trail_pct)
-                        if stop != stop or (side == 1 and cand > stop) or (side == -1 and cand < stop):
+                        if (
+                            stop != stop
+                            or (side == 1 and cand > stop)
+                            or (side == -1 and cand < stop)
+                        ):
                             stop = cand
                 else:
                     n_refused_log += 1
