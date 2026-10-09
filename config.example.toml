@@ -1,0 +1,33 @@
+# Configuration du robot. Copiez ce fichier en `config.toml` et adaptez-le.
+# Tout est en mode "paper" (argent fictif) par défaut : le bot ne peut PAS passer
+# d'ordre réel tant que `mode = "live"` n'est pas écrit ici ET que le flag
+# `--i-understand-the-risks` n'est pas passé à la commande `live`.
+
+[general]
+mode = "paper"              # "paper" (fictif) ou "live" (argent réel)
+exchange = "binance"        # identifiant ccxt : binance, kraken, coinbase, bybit...
+symbol = "BTC/USDT"
+timeframe = "1h"            # 1m, 5m, 15m, 1h, 4h, 1d
+state_dir = "state"         # où le bot mémorise ses positions / trades
+
+[strategy]
+name = "ema_trend"          # voir `tradingbot list-strategies`
+# Paramètres optionnels de la stratégie (sinon valeurs par défaut) :
+# [strategy.params]
+# fast = 20
+# slow = 50
+
+[risk]
+initial_cash = 1000.0       # capital de départ (paper) ou capital de référence (live)
+risk_per_trade = 0.01       # perte max acceptée par trade : 1 % du capital
+max_position_fraction = 0.95   # jamais plus de 95 % du capital sur une position
+max_drawdown = 0.20         # arrêt automatique si le capital perd 20 % depuis son plus haut
+daily_loss_limit = 0.05     # arrêt de la journée si -5 % sur la journée
+allow_short = false         # la vente à découvert est désactivée (spot)
+
+[costs]
+fee_rate = 0.001            # 0.1 % de frais par ordre (tarif courant sur Binance spot)
+slippage = 0.0005           # 0.05 % de glissement estimé par ordre
+
+[notifications]
+telegram = false            # true pour recevoir les trades sur Telegram (voir .env.example)

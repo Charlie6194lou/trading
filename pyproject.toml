@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradingbot"
+version = "0.1.0"
+description = "Robot de trading pédagogique : backtest, walk-forward, paper trading et live (opt-in) sur crypto via ccxt."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "ccxt>=4.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+plots = ["matplotlib>=3.8"]
+
+[project.scripts]
+tradingbot = "tradingbot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tradingbot*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
