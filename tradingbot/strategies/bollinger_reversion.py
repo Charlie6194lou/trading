@@ -14,8 +14,9 @@ Règles (position souhaitée pour la bougie suivante) :
 - Jamais de ``-1`` (achat uniquement) ; ``0`` tant que les indicateurs ne sont pas
   définis (période de chauffe).
 
-Stop : sur la bougie d'entrée uniquement, ``stop_loss = close - atr_mult * ATR`` ;
-``NaN`` ailleurs. Aucun look-ahead : les bandes utilisent une moyenne et un écart-type
+Stop : sur la bougie d'entrée, ``stop_loss = close - atr_mult * ATR`` ; ce stop d'entrée
+est ensuite porté tel quel sur chaque bougie tant que la position est tenue (``NaN`` quand
+le signal est 0). Aucun look-ahead : les bandes utilisent une moyenne et un écart-type
 glissants (jamais centrés, jamais calculés sur toute la série).
 """
 
@@ -127,6 +128,7 @@ class BollingerReversion(Strategy):
         stop = np.full(n, np.nan)
 
         pos = 0
+        cur_stop = np.nan  # stop d'entrée porté pendant toute la position
         n_entries = 0
         for t in range(n):
             if not valid[t]:
@@ -138,11 +140,13 @@ class BollingerReversion(Strategy):
                     pos = 0  # bougie de sortie : plate, pas de ré-entrée immédiate
                     continue
                 signal[t] = 1
+                stop[t] = cur_stop
                 continue
             if c < lower[t] and rsi[t] < rsi_max:
                 pos = 1
+                cur_stop = c - mult * atr[t]
                 signal[t] = 1
-                stop[t] = c - mult * atr[t]
+                stop[t] = cur_stop
                 n_entries += 1
 
         logger.debug(

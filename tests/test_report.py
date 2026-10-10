@@ -19,7 +19,10 @@ from conftest import make_ohlcv
 from tradingbot.backtest import metrics as metrics_mod
 from tradingbot.backtest.engine import TRADE_COLUMNS, BacktestConfig, BacktestResult, run_backtest
 from tradingbot.backtest.report import (
+    DAILY_LIMIT_MARK,
+    KILL_SWITCH_MARK,
     REPORT_FILES,
+    _fmt_price,
     _fmt_timeframe,
     _json_safe,
     format_comparison,
@@ -79,6 +82,9 @@ def make_result(
     metrics: dict[str, Any] | None = None,
     config: BacktestConfig | None = None,
     ppy: float = PPY,
+    warmup_bars: int = 0,
+    events: list[dict[str, Any]] | None = None,
+    daily_limit_active: bool = True,
 ) -> BacktestResult:
     idx = index(len(equity))
     eq = pd.Series(equity, index=idx, dtype=float, name="equity")
@@ -100,7 +106,17 @@ def make_result(
         metrics=metrics,
         signals=pd.DataFrame(index=idx),
         periods_per_year=ppy,
+        events=list(events) if events else [],
+        warmup_bars=warmup_bars,
+        daily_limit_active=daily_limit_active,
     )
+
+
+def bh_row(text: str) -> str:
+    """La ligne « Buy & hold » du tableau comparatif (pas la note qui suit)."""
+    rows = [ln for ln in text.splitlines() if ln.startswith("Buy & hold") and "|" in ln]
+    assert len(rows) == 1, text
+    return rows[0]
 
 
 class ScriptedStrategy:
@@ -183,10 +199,12 @@ def test_format_report_hand_computed_values() -> None:
     text = format_report(result, benchmark_return=0.05)
     assert "Rendement total            : +12.30 %" in text
     assert "Capital final              : 11 230.00" in text
-    assert "Capital initial   : 10 000.00" in text
+    assert "Capital initial      : 10 000.00" in text
     assert "Drawdown maximal           : -2.86 %" in text
     assert "Durée max du drawdown      : 1 bougies" in text
-    assert "Paramètres        : fast=5, slow=20" in text
+    assert "Paramètres           : fast=5, slow=20" in text
+    assert "Ré-entrée après stop : attente d'un nouveau signal" in text
+    assert "Stop de protection   : toujours présent" in text
     assert "Stratégie  : +12.30 %" in text
     assert "Buy & hold : +5.00 %" in text
     assert "Écart      : +7.30 points" in text
@@ -278,6 +296,81 @@ def test_fmt_timeframe() -> None:
     assert _fmt_timeframe(index(1)) == "n/d"
 
 
+def test_format_report_guard_rails_section() -> None:
+    """M4 / D6 : les garde-fous déclenchés sont expliqués dans le rapport."""
+    kill = {
+        "timestamp": "2024-01-03T04:00:00+00:00",
+        "type": "kill_switch",
+        "equity": 7_857.0,
+        "drawdown": 0.2143,
+        "detail": "drawdown 21.4 % > 20 %",
+    }
+    daily = {
+        "timestamp": "2024-01-02T10:00:00+00:00",
+        "type": "daily_limit",
+        "equity": 9_400.0,
+        "drawdown": 0.06,
+        "detail": "perte journalière 6.0 % > 5 %",
+    }
+    result = make_result([10_000.0, 9_400.0, 7_857.0, 7_857.0], events=[daily, kill])
+    text = format_report(result)
+    section = text.split("Garde-fous déclenchés")[1].split("Trades détaillés")[0]
+    assert "Garde-fous déclenchés" in text
+    assert "Comparaison avec le buy & hold" in text.split("Garde-fous déclenchés")[0]
+    assert (
+        "le robot a cessé de trader le 2024-01-03 04:00 après une baisse de 21.43 % depuis le "
+        "sommet" in flat(section)
+    )
+    assert "capital 7 857.00" in flat(section)
+    assert "Limite journalière le 2024-01-02 10:00 (capital 9 400.00)" in flat(section)
+    assert "jusqu'au jour UTC suivant" in flat(section)
+    assert "inactive" not in section
+    # sans événement : une ligne le dit explicitement
+    clean = format_report(make_result([10_000.0, 10_100.0]))
+    assert "Aucun garde-fou déclenché" in clean
+    # limite journalière désactivée (bougies >= 1 jour) : expliqué au débutant
+    daily_bars = format_report(make_result([10_000.0, 10_100.0], daily_limit_active=False))
+    assert "Limite de perte journalière : inactive" in flat(daily_bars)
+    assert "bougies >= 1 jour" in flat(daily_bars)
+
+
+def test_format_report_buy_hold_note_mentions_tradable_period() -> None:
+    result = make_result([10_000.0, 10_100.0, 10_200.0], warmup_bars=1)
+    result.metrics["buy_hold_return"] = 0.03
+    text = format_report(result)
+    assert "Buy & hold : +3.00 %" in text
+    assert "Buy & hold sur la même période tradable, frais inclus" in flat(text)
+    assert "après 1 bougies de chauffe" in flat(text)
+    # un benchmark fourni par l'appelant n'est pas présenté comme net de frais
+    explicit = format_report(result, benchmark_return=0.05)
+    assert "même période tradable" not in explicit
+
+
+def test_fmt_price_significant_digits() -> None:
+    """F42 : les prix sous 1e-4 (SHIB, PEPE…) ne s'affichent plus « 0.0000 »."""
+    assert _fmt_price(100.0) == "100.0000"
+    assert _fmt_price(100_000.1234) == "100000.1234"
+    assert _fmt_price(1.5) == "1.5000"
+    assert _fmt_price(0.5) == "0.5"
+    assert _fmt_price(0.000123456) == "0.000123456"
+    assert _fmt_price(1.2e-05) == "1.2e-05"
+    assert _fmt_price(2.11649e-08) == "2.11649e-08"
+    assert _fmt_price(-0.5) == "-0.5"
+    assert _fmt_price(float("nan")) == "n/d"
+    assert _fmt_price(None) == "n/d"
+    assert _fmt_price(math.inf) == "∞"
+
+
+def test_format_report_trade_prices_below_one_cent_are_readable() -> None:
+    trades = make_trades([10.0, -20.0])
+    trades.loc[:, "entry_price"] = np.array([1.2e-05, 2.11649e-08])
+    trades.loc[:, "exit_price"] = np.array([1.3e-05, 1.80585e-08])
+    text = format_report(make_result([10_000.0] * 10, trades=trades))
+    assert "1.2e-05" in text and "1.3e-05" in text
+    assert "2.11649e-08" in text and "1.80585e-08" in text
+    assert "0.0000 |" not in text
+
+
 # ============================================================================ format_comparison
 def _metrics(sharpe: float, total: float, trades: int) -> dict[str, Any]:
     return {
@@ -301,38 +394,127 @@ def test_format_comparison_sorted_by_sharpe_with_buy_hold_row() -> None:
     for col in ("Stratégie", "Rendement", "CAGR", "Sharpe", "Max DD", "Trades", "Réussite"):
         assert col in lines[2]
     assert text.index("beta") < text.index("gamma") < text.index("alpha")
-    assert lines[-1].startswith("Buy & hold")
-    assert "+2.00 %" in lines[-1]
+    row = bh_row(text)
+    assert "+2.00 %" in row
+    # la ligne buy & hold vient après toutes les stratégies, puis la note explicative
+    assert text.index("alpha") < text.index(row) < text.index("période tradable commune")
+    assert KILL_SWITCH_MARK not in text and "inactive" not in text
     assert "+5.00 %" in text and "-1.00 %" in text
     assert "| 7 |" in text.replace("  ", " ") or " 7 |" in text
     assert "50.00 %" in text
 
 
 def test_format_comparison_with_benchmark_series() -> None:
+    frictionless = BacktestConfig(initial_cash=10_000.0, fee_rate=0.0, slippage=0.0)
     a = make_result(
-        [10_000.0, 10_100.0, 10_200.0], name="alpha", metrics=_metrics(0.5, 0.02, 3), ppy=365.0
+        [10_000.0, 10_100.0, 10_200.0],
+        name="alpha",
+        metrics=_metrics(0.5, 0.02, 3),
+        ppy=365.0,
+        config=frictionless,
     )
     bench = pd.Series([100.0, 110.0, 121.0], index=index(3, "1D"))
     text = format_comparison([a], benchmark=bench)
-    last = text.splitlines()[-1]
-    assert last.startswith("Buy & hold")
+    last = bh_row(text)
     assert "+21.00 %" in last
     # rendements 0, 10 %, 10 % : moyenne 1/15, écart-type (ddof=1) sqrt(1/300)
     expected = (1 / 15) / math.sqrt(1 / 300) * math.sqrt(365.0)
     assert expected == pytest.approx(22.06, abs=0.005)
     assert f"{expected:.2f}" in last
     assert "+0.00 %" in last  # pas de drawdown
+    # CAGR sur le temps écoulé : 2 jours → (1,21)^(365/2) - 1 ≈ 1,28e18 (fini, affiché tel quel)
+    cagr_cell = float(last.split("|")[2].strip().rstrip(" %").replace(" ", ""))
+    assert cagr_cell == pytest.approx((1.21 ** (365 / 2) - 1) * 100, rel=1e-9)
 
 
-def test_format_comparison_benchmark_overflow_falls_back() -> None:
-    # +21 % en 2 bougies horaires : CAGR hors de portée d'un float → ligne de repli
+def test_format_comparison_buy_hold_row_is_net_of_costs() -> None:
+    """D8 : la ligne buy & hold paie un aller-retour de frais + glissement comme un trade."""
+    cfg = BacktestConfig(initial_cash=10_000.0, fee_rate=0.001, slippage=0.0005)
+    a = make_result(
+        [10_000.0, 10_100.0, 10_200.0], name="alpha", metrics=_metrics(0.5, 0.02, 3), config=cfg
+    )
+    bench = pd.Series([100.0, 110.0, 121.0], index=index(3, "1D"))
+    text = format_comparison([a], benchmark=bench)
+    # achat 100 × 1.0005 × 1.001, revente 121 × 0.9995 × 0.999
+    expected = 121.0 * 0.9995 * 0.999 / (100.0 * 1.0005 * 1.001) - 1.0
+    assert expected == pytest.approx(0.2064, abs=5e-5)
+    assert f"{expected * 100:+.2f} %" in bh_row(text)
+    assert "frais et glissement inclus" in text
+
+
+def test_format_comparison_buy_hold_starts_after_longest_warmup() -> None:
+    """D8 / F54 : le buy & hold part de la première bougie tradable par toutes les stratégies
+    (``max(warmup) + 1``), pas de la première bougie du fichier."""
+    frictionless = BacktestConfig(initial_cash=10_000.0, fee_rate=0.0, slippage=0.0)
+    a = make_result([10_000.0] * 5, name="a", metrics=_metrics(0.5, 0.02, 3), config=frictionless)
+    b = make_result(
+        [10_000.0] * 5,
+        name="b",
+        metrics=_metrics(0.4, 0.01, 2),
+        config=frictionless,
+        warmup_bars=2,
+    )
+    bench = pd.Series([100.0, 110.0, 121.0, 120.0, 150.0], index=index(5))
+    text = format_comparison([a, b], benchmark=bench)
+    # première bougie tradable = 2 + 1 = 3 : 150 / 120 - 1 = +25 % (et non 150 / 100 - 1)
+    assert "+25.00 %" in bh_row(text)
+    assert "+50.00 %" not in text
+    assert "plus longue chauffe : 2 bougies" in flat(text)
+    # sans série de prix : rendement net du moteur de la stratégie à la plus longue chauffe
+    b.metrics["buy_hold_return"] = 0.25
+    text = format_comparison([a, b])
+    assert "+25.00 %" in bh_row(text)
+    assert "–" in bh_row(text)  # Sharpe et drawdown indisponibles sans série de prix
+
+
+def test_format_comparison_benchmark_huge_cagr_never_raises() -> None:
+    # +21 % en 2 bougies horaires : CAGR hors de portée d'un float → « ∞ », pas d'exception
     a = make_result([10_000.0, 10_100.0, 10_200.0], name="alpha", metrics=_metrics(0.5, 0.02, 3))
     bench = pd.Series([100.0, 110.0, 121.0], index=index(3))
-    text = format_comparison([a], benchmark=bench)
-    last = text.splitlines()[-1]
-    assert last.startswith("Buy & hold")
-    assert "+2.00 %" in last  # buy_hold_return des métriques
-    assert "–" in last  # Sharpe et drawdown indisponibles dans la ligne de repli
+    row = bh_row(format_comparison([a], benchmark=bench))
+    assert "∞" in row
+    assert "1" in row
+    # repli sans série de prix : même convention (CAGR via le temps écoulu, ∞ ici aussi)
+    row = bh_row(format_comparison([a]))
+    assert "+2.00 %" in row and "–" in row
+
+
+def test_format_comparison_marks_guard_rails_and_inactive_daily_limit() -> None:
+    """M4 / D6 : une stratégie arrêtée par le kill switch est marquée « ⚠ arrêt »."""
+    kill = {
+        "timestamp": "2024-01-03T04:00:00+00:00",
+        "type": "kill_switch",
+        "equity": 7_900.0,
+        "drawdown": 0.21,
+        "detail": "drawdown 21.0 % > 20 %",
+    }
+    daily = {
+        "timestamp": "2024-01-02T10:00:00+00:00",
+        "type": "daily_limit",
+        "equity": 9_400.0,
+        "drawdown": 0.06,
+        "detail": "perte journalière 6.0 % > 5 %",
+    }
+    a = make_result([10_000.0] * 4, name="stoppee", metrics=_metrics(0.5, -0.21, 3), events=[kill])
+    b = make_result(
+        [10_000.0] * 4, name="bloquee", metrics=_metrics(1.0, 0.01, 4), events=[daily, daily]
+    )
+    c = make_result([10_000.0] * 4, name="saine", metrics=_metrics(2.0, 0.05, 5))
+    text = format_comparison([a, b, c])
+    rows = {ln.split("|")[0].strip(): ln for ln in text.splitlines() if "|" in ln}
+    assert f"stoppee {KILL_SWITCH_MARK}" in rows
+    assert f"bloquee {DAILY_LIMIT_MARK} ×2" in rows
+    assert "saine" in rows
+    assert "kill switch déclenché (stoppee)" in flat(text)
+    assert "n'est pas comparable" in flat(text)
+    assert "inactive" not in text
+    # limite journalière inactive (bougies >= 1 jour) : une note sous le tableau
+    d = make_result(
+        [10_000.0] * 4, name="quotidienne", metrics=_metrics(0.1, 0.0, 1), daily_limit_active=False
+    )
+    text = format_comparison([d])
+    assert "Limite de perte journalière inactive : bougies >= 1 jour" in flat(text)
+    assert "⚠" not in text
 
 
 def test_format_comparison_duplicate_names_show_params() -> None:

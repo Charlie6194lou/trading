@@ -14,8 +14,11 @@ Signal (position souhaitée pour la bougie suivante) :
 
 Stop : sur la bougie d'entrée (passage de 0 à ±1, ou retournement ±1 → ∓1),
 ``stop_loss`` vaut ``close - atr_mult * ATR`` pour un achat et ``close + atr_mult * ATR``
-pour une vente à découvert ; ``NaN`` sur les autres bougies (le moteur conserve alors le
-stop initial). Aucun look-ahead : la bougie ``t`` n'utilise que les données ``<= t``.
+pour une vente à découvert ; ce stop d'entrée est ensuite **porté tel quel sur chaque
+bougie** tant que la position est tenue (``signal[t] == signal[t-1] != 0``), afin qu'un
+moteur ou un bot qui entre (ou ré-entre) en cours de position dispose toujours du stop ;
+``NaN`` quand le signal est 0. Aucun look-ahead : la bougie ``t`` n'utilise que les
+données ``<= t``.
 """
 
 from __future__ import annotations
@@ -119,11 +122,16 @@ class SmaCross(Strategy):
 
         prev = np.concatenate(([0], signal[:-1]))
         entry = (signal != 0) & (signal != prev)
-        stop = np.where(
+        stop_at_entry = np.where(
             entry,
             close.to_numpy() - signal * p["atr_mult"] * atr.to_numpy(),
             np.nan,
         )
+        # Le stop d'entrée est porté (constant) sur toute la position : chaque segment de
+        # signal non nul commence par une entrée, le report avant ne traverse donc jamais
+        # une position précédente ; NaN dès que le signal est 0.
+        stop = pd.Series(stop_at_entry, index=df.index).ffill().to_numpy(copy=True)
+        stop[signal == 0] = np.nan
         logger.debug(
             "sma_cross(%d/%d) : %d bougies, %d entrées", p["fast"], p["slow"], len(df), entry.sum()
         )

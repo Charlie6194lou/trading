@@ -1,10 +1,12 @@
 """Tests du CcxtBroker avec un faux exchange (aucun réseau) : garde confirm_live, appels
-effectués, arrondi à la précision, minimums du marché, mapping des réponses, erreurs ccxt
-encapsulées, jamais de retrait ni de levier."""
+effectués, arrondi à la précision, minimums du marché, mapping des réponses (ordres
+rejetés / partiels), poussière invendable, prix exigé pour les achats au marché, erreurs
+ccxt encapsulées avec masquage des secrets, jamais de retrait ni de levier."""
 
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
@@ -14,7 +16,7 @@ import ccxt
 import pytest
 
 from tradingbot.execution.broker import BrokerError, Order, Position
-from tradingbot.execution.ccxt_broker import CcxtBroker, split_symbol
+from tradingbot.execution.ccxt_broker import CcxtBroker, scrub_secrets, split_symbol
 
 BTC = "BTC/USDT"
 FORBIDDEN_CALLS = {"withdraw", "set_leverage", "set_margin_mode", "transfer", "borrow_margin"}
@@ -289,10 +291,29 @@ def test_get_position_from_balance_without_tracking() -> None:
 
 
 def test_get_position_dust_is_flat() -> None:
-    broker, _ = make_broker(FakeExchange(balance=default_balance(btc_total=0.000001)))
+    broker, fake = make_broker(FakeExchange(balance=default_balance(btc_total=0.000001)))
     pos = broker.get_position(BTC)
     assert pos == Position(BTC)
     assert not pos.is_open
+    assert fake.count("fetch_ticker") == 0  # sous amount.min : pas besoin du prix
+
+
+def test_get_position_dust_under_min_cost_is_flat() -> None:
+    """F9 : 0,00003 BTC >= amount.min (0,00001) mais 0,60 USDT < cost.min (5) : invendable,
+    donc plat (sinon le bot « tient » une position qu'il ne peut jamais clôturer)."""
+    broker, fake = make_broker(FakeExchange(balance=default_balance(btc_total=0.00003)))
+    pos = broker.get_position(BTC)
+    assert pos == Position(BTC)
+    assert fake.count("fetch_ticker") == 1
+    # juste au-dessus du minimum de notionnel : position réelle (0,0003 × 20 000 = 6 USDT)
+    fake.balance = default_balance(btc_total=0.0003)
+    assert broker.get_position(BTC).amount == pytest.approx(0.0003)
+    # sans cost.min : amount.min seul décide, et le ticker n'est pas consulté
+    fake2 = FakeExchange(balance=default_balance(btc_total=0.00003))
+    fake2.markets_data[BTC]["limits"]["cost"]["min"] = None
+    broker2, _ = make_broker(fake2)
+    assert broker2.get_position(BTC).amount == pytest.approx(0.00003)
+    assert fake2.count("fetch_ticker") == 0
 
 
 def test_get_position_never_short_on_spot() -> None:
@@ -420,6 +441,39 @@ def test_sell_order_sent_with_sell_side() -> None:
     assert order.side == "sell" and order.price == 19_900.0
 
 
+def test_market_buy_passes_reference_price_when_exchange_requires_it() -> None:
+    """F27 : Coinbase, Gate... exigent un prix pour un achat au marché (ccxt convertit la
+    quantité en montant à dépenser) ; sans ce prix ccxt refuse l'ordre avant tout appel."""
+    fake = FakeExchange(
+        order_responses=[default_order_response(), default_order_response(side="sell")]
+    )
+    fake.options = {"createMarketBuyOrderRequiresPrice": True}
+    broker, _ = make_broker(fake)
+    broker.market_order(BTC, "buy", 0.01)
+    assert fake.args_of("create_order") == [(BTC, "market", "buy", 0.01, 20_000.0, None)]
+    assert fake.count("fetch_ticker") == 1  # le prix du min cost est réutilisé
+    broker.market_order(BTC, "sell", 0.01)  # une vente n'a pas besoin de prix
+    assert fake.args_of("create_order")[1] == (BTC, "market", "sell", 0.01, None, None)
+
+
+def test_market_buy_fetches_price_when_required_and_no_min_cost() -> None:
+    fake = FakeExchange(order_responses=[default_order_response(symbol="ETH/USDT", average=1500.0)])
+    fake.options = {"createMarketBuyOrderRequiresPrice": True}
+    fake.ticker = {"last": 1500.0}
+    broker, _ = make_broker(fake)
+    broker.market_order("ETH/USDT", "buy", 0.1)  # ETH/USDT n'a pas de cost.min
+    assert fake.args_of("create_order") == [("ETH/USDT", "market", "buy", 0.1, 1500.0, None)]
+    assert fake.count("fetch_ticker") == 1
+
+
+def test_market_buy_without_price_when_option_false_or_absent() -> None:
+    fake = FakeExchange()
+    fake.options = {"createMarketBuyOrderRequiresPrice": False}
+    broker, _ = make_broker(fake)
+    broker.market_order(BTC, "buy", 0.01)
+    assert fake.args_of("create_order") == [(BTC, "market", "buy", 0.01, None, None)]
+
+
 # ============================================================================ mapping de la réponse
 def test_fee_in_base_currency_converted_to_quote() -> None:
     resp = default_order_response(fee={"cost": 0.0001, "currency": "BTC"}, average=20_000.0)
@@ -476,7 +530,7 @@ def test_missing_filled_assumes_sent_amount() -> None:
     [
         ("closed", "filled"),
         ("open", "open"),
-        ("canceled", "rejected"),
+        ("canceled", "partial"),  # annulé APRÈS une exécution partielle (filled 0,12345)
         (None, "filled"),
         ("ZZZ", "filled"),
     ],
@@ -486,6 +540,45 @@ def test_status_mapping(raw: str | None, expected: str) -> None:
     order = broker.market_order(BTC, "buy", 0.1)
     assert order.status == expected
     assert order.info["exchange_status"] == raw
+
+
+@pytest.mark.parametrize("raw", ["canceled", "cancelled", "rejected", "expired"])
+@pytest.mark.parametrize("filled", [0.0, None])
+def test_rejected_order_without_fill_raises(raw: str, filled: float | None) -> None:
+    """F4 : un ordre annulé / rejeté sans exécution n'est pas un ordre exécuté."""
+    resp = default_order_response(status=raw, filled=filled, average=None, cost=None)
+    broker, fake = make_broker(FakeExchange(order_responses=[resp]))
+    with pytest.raises(BrokerError, match="rejeté par l'exchange") as exc_info:
+        broker.market_order(BTC, "buy", 0.1)
+    assert raw in str(exc_info.value) and "123" in str(exc_info.value)
+    assert fake.count("create_order") == 1
+    # rien n'est suivi localement
+    fake.balance = default_balance(btc_total=0.1)
+    assert broker.get_position(BTC).entry_price == 0.0
+
+
+def test_partially_filled_then_canceled_order_reports_executed_amount(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    resp = default_order_response(status="canceled", filled=0.04, average=20_000.0)
+    broker, fake = make_broker(FakeExchange(order_responses=[resp]))
+    with caplog.at_level(logging.WARNING, logger="tradingbot.execution.ccxt_broker"):
+        order = broker.market_order(BTC, "buy", 0.1)
+    assert order.status == "partial"
+    assert order.amount == 0.04
+    assert order.info["sent_amount"] == 0.1
+    assert "exécuté partiellement" in caplog.text
+    # la quantité réellement exécutée est suivie (prix d'entrée)
+    fake.balance = default_balance(btc_total=0.04)
+    pos = broker.get_position(BTC)
+    assert pos.amount == 0.04 and pos.entry_price == pytest.approx(20_000.0)
+
+
+def test_closed_order_with_smaller_fill_keeps_actual_amount() -> None:
+    resp = default_order_response(status="closed", filled=0.07)
+    broker, _ = make_broker(FakeExchange(order_responses=[resp]))
+    order = broker.market_order(BTC, "buy", 0.1)
+    assert order.status == "filled" and order.amount == 0.07
 
 
 def test_timestamp_fallbacks() -> None:
@@ -568,6 +661,39 @@ def test_load_markets_error_wrapped() -> None:
         broker.market_order(BTC, "buy", 0.1)
     with pytest.raises(BrokerError):
         broker.get_position(BTC)
+
+
+def test_api_key_scrubbed_from_error_messages(caplog: pytest.LogCaptureFixture) -> None:
+    """F28 : ccxt recopie l'URL signée (clé en paramètre sur htx, upbit...) dans ses erreurs."""
+    key, secret = "LEAKME_APIKEY_0123456789", "U1VQRVJTRUNSRVQ="
+    cause = ccxt.ExchangeNotAvailable(
+        f"htx GET https://api.huobi.pro/v1/account/accounts?AccessKeyId={key}"
+        f"&Signature=abc%3D&Timestamp=2024 503 <html>cloudflare</html> secret={secret}"
+    )
+    fake = FakeExchange(errors={"fetch_balance": cause})
+    broker = CcxtBroker("htx", key, secret, confirm_live=True, exchange=fake)
+    with pytest.raises(BrokerError) as exc_info:
+        broker.get_balance(BTC)
+    text = str(exc_info.value)
+    assert key not in text and secret not in text
+    assert "***" in text and "ExchangeNotAvailable" in text and "api.huobi.pro" in text
+    # l'exception d'origine (chaînée, visible au niveau debug) est elle aussi masquée
+    assert exc_info.value.__cause__ is cause
+    assert key not in str(cause) and secret not in str(cause)
+    assert key not in repr(broker)
+
+
+def test_scrub_secrets_helper() -> None:
+    text = (
+        "GET https://x.test/a?apiKey=K1&sign=S1&ts=5 then https://y.test/b?foo=bar key=K1 "
+        "plain K2 and {'msg': 'ok'}"
+    )
+    out = scrub_secrets(text, ["K1", "K2", "", None])
+    assert "K1" not in out and "K2" not in out
+    assert out.startswith("GET https://x.test/a?*** then https://y.test/b?*** ")
+    assert "{'msg': 'ok'}" in out
+    assert scrub_secrets("rien à cacher", []) == "rien à cacher"
+    assert scrub_secrets("?access_key=abc&Signature=def", []) == "?access_key=***&Signature=***"
 
 
 def test_balance_error_wrapped() -> None:

@@ -12,15 +12,30 @@ découpe l'historique en fenêtres successives :
 
 La courbe OOS obtenue en enchaînant les fenêtres de test est une estimation honnête de
 ce que la stratégie aurait donné « en vrai ». Le :attr:`WalkForwardResult.overfit_ratio`
-(métrique OOS moyenne / métrique IS moyenne) résume l'écart : proche de 1 = robuste,
-très inférieur à 1 = sur-apprentissage.
+résume l'écart entre la métrique moyenne hors échantillon et en échantillon : proche de
+1 = robuste, très inférieur à 1 = sur-apprentissage (voir :func:`_overfit_ratio`).
 
 Conventions :
 
 - toutes les bornes de fenêtres sont des **positions** (``iloc``) ; fin exclusive ;
 - ``train_bars`` et ``test_bars`` sont obligatoires (voir :func:`default_windows`) ;
 - la métrique d'optimisation doit être « plus grand = mieux » (``sharpe``, ``sortino``,
-  ``calmar``, ``total_return``, ``cagr``, ``profit_factor``, ``max_drawdown`` qui est négatif…).
+  ``calmar``, ``total_return``, ``cagr``, ``profit_factor``, ``max_drawdown`` qui est
+  négatif : -5 % vaut mieux que -10 %) ;
+- **même base IS et OOS** : chaque backtest (entraînement comme test) reçoit
+  ``strategy.warmup_bars()`` bougies d'historique avant sa fenêtre quand elles existent, et
+  sa métrique est calculée à partir de la première bougie où la stratégie peut décider
+  (bougie de chauffe exclues). Les fenêtres d'entraînement et de test sont donc jugées sur
+  des bougies réellement tradées, et des combinaisons de chauffe différente sont classées
+  sur un pied d'égalité ;
+- les moyennes IS / OOS sont **pondérées par le nombre de bougies de test** de chaque
+  fenêtre (une dernière fenêtre tronquée ne pèse pas autant qu'une fenêtre complète) et
+  ignorent les valeurs infinies ou indéfinies ;
+- la position est **fermée à la fin de chaque fenêtre de test** et rouverte au début de la
+  suivante (le moteur repart à plat) : le résumé compte ces aller-retours et leurs frais ;
+- le kill switch et la limite journalière du :class:`~tradingbot.risk.RiskManager`
+  repartent de zéro à chaque fenêtre ; le résumé vérifie après coup la courbe OOS
+  enchaînée contre ``max_drawdown`` et avertit si, en réel, le robot aurait été arrêté.
 """
 
 from __future__ import annotations
@@ -36,7 +51,9 @@ import numpy as np
 import pandas as pd
 
 from tradingbot.backtest import metrics as metrics_mod
-from tradingbot.backtest.engine import BacktestConfig, run_backtest
+from tradingbot.backtest.engine import BacktestConfig, BacktestResult, run_backtest
+from tradingbot.backtest.engine import _buy_hold_return as _net_buy_hold_return
+from tradingbot.risk import RiskConfig
 
 if TYPE_CHECKING:
     from tradingbot.risk import RiskManager
@@ -169,6 +186,86 @@ def _sort_table(
     return ordered.reset_index(drop=True), params
 
 
+@dataclass
+class _WindowRun:
+    """Backtest d'une fenêtre ``[start, end)`` avec historique de chauffe, restreint à la
+    fenêtre (voir :func:`_backtest_window`)."""
+
+    result: BacktestResult
+    #: équité, positions et trades restreints à la fenêtre ``[start, end)``
+    equity: pd.Series
+    positions: pd.Series
+    trades: pd.DataFrame
+    #: métriques calculées à partir de la première bougie de décision (chauffe exclue)
+    metrics: dict[str, float | int]
+    #: position (dans ``data``) de la première bougie de décision utilisée par ``metrics``
+    metric_start: int
+
+
+def _backtest_window(
+    data: pd.DataFrame,
+    strategy: Strategy,
+    start: int,
+    end: int,
+    config: BacktestConfig | None,
+    risk: RiskManager | None,
+) -> _WindowRun:
+    """Backteste ``strategy`` sur la fenêtre ``data.iloc[start:end]`` sur la base commune
+    IS / OOS.
+
+    Le backtest reçoit ``warmup`` bougies d'historique avant ``start`` (quand elles
+    existent) pour amorcer les indicateurs ; équité, positions et trades sont ensuite
+    restreints à la fenêtre. Les métriques sont calculées à partir de la première bougie où
+    la stratégie peut décider : ``start`` si l'historique est complet, sinon la fin de la
+    chauffe (``warmup``), afin que les bougies plates de chauffe ne diluent pas le Sharpe
+    ni n'allongent le CAGR. ``buy_hold_return`` y est le buy & hold net (règle 8 du moteur)
+    de la première ouverture tradable de la fenêtre à sa dernière clôture.
+    """
+    cfg = config if config is not None else BacktestConfig()
+    n = len(data)
+    start = max(0, int(start))
+    end = min(n, int(end))
+    warmup = max(0, int(getattr(strategy, "warmup_bars", lambda: 0)()))
+    hist_start = max(0, start - warmup)
+    frame = data.iloc[hist_start:end]
+    result = run_backtest(frame, strategy, config=cfg, risk=risk)
+    offset = start - hist_start
+    n_frame = len(frame)
+
+    equity = result.equity.iloc[offset:]
+    positions = result.positions.iloc[offset:]
+    trades = result.trades
+    if len(trades) and len(equity):
+        trades = trades.loc[trades["entry_time"] >= equity.index[0]]
+
+    metric_offset = min(max(offset, warmup), max(n_frame - 1, 0))
+    first_tradable = min(metric_offset + 1, n_frame - 1) if n_frame > 1 else 0
+    metrics = metrics_mod.compute_metrics(
+        result.equity.iloc[metric_offset:],
+        trades,
+        float(result.periods_per_year),
+        benchmark=frame["close"].iloc[metric_offset:],
+        positions=result.positions.iloc[metric_offset:],
+    )
+    if n_frame:
+        metrics["buy_hold_return"] = _net_buy_hold_return(
+            float(frame["open"].iloc[first_tradable]),
+            float(frame["close"].iloc[-1]),
+            float(cfg.fee_rate),
+            float(cfg.slippage),
+        )
+    metrics["kill_switch_triggered"] = int(result.metrics.get("kill_switch_triggered", 0))
+    metrics["n_daily_limit_hits"] = int(result.metrics.get("n_daily_limit_hits", 0))
+    return _WindowRun(
+        result=result,
+        equity=equity,
+        positions=positions,
+        trades=trades,
+        metrics=metrics,
+        metric_start=hist_start + metric_offset,
+    )
+
+
 def _evaluate_grid(
     df: pd.DataFrame,
     strategy_cls: type[Strategy],
@@ -177,25 +274,29 @@ def _evaluate_grid(
     risk: RiskManager | None,
     metric: str,
     param_names: list[str],
+    start: int = 0,
+    end: int | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    """Backteste chaque combinaison ; renvoie (tableau trié, paramètres alignés)."""
+    """Backteste chaque combinaison sur ``df.iloc[start:end]`` (:func:`_backtest_window`) ;
+    renvoie (tableau trié, paramètres alignés)."""
     rows: list[dict[str, Any]] = []
     kept: list[dict[str, Any]] = []
+    end = len(df) if end is None else int(end)
     for params in combos:
         try:
             strategy = strategy_cls(**params)
-            result = run_backtest(df, strategy, config=config, risk=risk)
+            run = _backtest_window(df, strategy, start, end, config, risk)
         except Exception as exc:  # noqa: BLE001 - une combinaison ne doit pas tout arrêter
             logger.warning("Combinaison %s ignorée : %s", params, exc)
             logger.debug("Détail de l'erreur pour %s", params, exc_info=exc)
             continue
         row: dict[str, Any] = dict(params)
-        row.update(result.metrics)
+        row.update(run.metrics)
         rows.append(row)
         kept.append(dict(params))
     columns = [*param_names, *metrics_mod.METRIC_KEYS]
     if not rows:
-        logger.warning("Aucune combinaison n'a pu être évaluée sur %d bougies", len(df))
+        logger.warning("Aucune combinaison n'a pu être évaluée sur %d bougies", end - start)
         return pd.DataFrame(columns=columns), []
     table = pd.DataFrame(rows)
     for col in columns:
@@ -206,17 +307,41 @@ def _evaluate_grid(
     return _sort_table(table, metric, kept)
 
 
-def _finite_mean(values: Iterable[float]) -> float:
-    """Moyenne en ignorant les NaN ; NaN si aucune valeur."""
-    vals = [float(v) for v in values if not math.isnan(float(v))]
-    return float(np.mean(vals)) if vals else math.nan
+def _finite_mean(values: Iterable[float], weights: Iterable[float] | None = None) -> float:
+    """Moyenne (pondérée par ``weights`` si fournis) des valeurs **finies** ; NaN si aucune.
+
+    Les NaN et les infinis (ex. ``profit_factor`` d'une fenêtre sans perte) sont ignorés,
+    de même que les poids nuls ou négatifs.
+    """
+    vals = [float(v) for v in values]
+    wts = [1.0] * len(vals) if weights is None else [float(w) for w in weights]
+    pairs = [(v, w) for v, w in zip(vals, wts, strict=True) if math.isfinite(v) and w > 0]
+    if not pairs:
+        return math.nan
+    total = sum(w for _, w in pairs)
+    return float(sum(v * w for v, w in pairs) / total)
 
 
 def _overfit_ratio(is_mean: float, oos_mean: float) -> float:
-    """``oos_mean / is_mean`` si ``is_mean`` est fini et > 0, sinon NaN."""
-    if not math.isfinite(is_mean) or is_mean <= 0 or math.isnan(oos_mean):
+    """Ratio de sur-apprentissage : « à quel point le hors échantillon vaut l'échantillon ».
+
+    - ``is_mean > 0`` : ``oos_mean / is_mean`` (Sharpe, rendement… positifs) ;
+    - ``is_mean < 0`` et ``oos_mean < 0`` : ``is_mean / oos_mean`` = ``|IS| / |OOS|``, pour
+      les métriques négatives où « plus grand = mieux » (``max_drawdown`` : IS -5 %,
+      OOS -10 % → 0,5) ;
+    - sinon (moyenne IS nulle, non finie, ou de signe opposé à la moyenne OOS) : NaN, le
+      ratio n'a pas de sens.
+
+    Dans tous les cas : ≈ 1 = la stratégie se comporte pareil hors échantillon ; < 1 =
+    moins bien (sur-apprentissage) ; > 1 = mieux.
+    """
+    if not math.isfinite(is_mean) or not math.isfinite(oos_mean) or is_mean == 0:
         return math.nan
-    return float(oos_mean / is_mean)
+    if is_mean > 0:
+        return float(oos_mean / is_mean)
+    if oos_mean < 0:
+        return float(is_mean / oos_mean)
+    return math.nan
 
 
 def _fmt_ts(ts: Any) -> str:
@@ -303,8 +428,13 @@ def grid_search(
         cartésien ; le dépassement est signalé par un avertissement. ``None`` = illimité.
     :returns: un ``DataFrame`` avec une colonne par paramètre de la grille puis toutes les
         métriques de :func:`~tradingbot.backtest.metrics.compute_metrics`, trié par
-        ``metric`` décroissant (NaN en dernier). Une combinaison qui lève une exception est
-        journalisée et ignorée (pas de ligne).
+        ``metric`` décroissant (NaN en dernier). Les métriques de chaque combinaison sont
+        calculées **à partir de la fin de sa période de chauffe** (bougies plates exclues :
+        ``total_return``, ``max_drawdown`` et ``n_trades`` sont identiques à ceux de
+        :func:`~tradingbot.backtest.engine.run_backtest`, mais Sharpe, CAGR et exposition
+        ne sont pas dilués par la chauffe, ce qui permet de comparer des combinaisons de
+        chauffe différente). Une combinaison qui lève une exception est journalisée et
+        ignorée (pas de ligne).
     :raises ValueError: paramètre inconnu, grille vide pour un paramètre, plafond ≤ 0.
     """
     data = _normalise(df)
@@ -328,18 +458,21 @@ class WalkForwardResult:
 
     #: une entrée par fenêtre : positions ``train_start``/``train_end``/``test_start``/
     #: ``test_end`` (fin exclusive), ``best_params``, ``is_metric``, ``oos_metric`` et des
-    #: informations complémentaires (horodatages, nombre de trades, rendement OOS)
+    #: informations complémentaires (horodatages, nombre de trades, rendement OOS,
+    #: ``oos_kill_switch`` si le kill switch s'est déclenché dans la fenêtre)
     windows: list[dict[str, Any]]
     #: équité hors échantillon recomposée en enchaînant les rendements des fenêtres de
     #: test, à partir de ``config.initial_cash``
     oos_equity: pd.Series
-    #: métriques de ``oos_equity`` (:func:`~tradingbot.backtest.metrics.compute_metrics`)
+    #: métriques de ``oos_equity`` (:func:`~tradingbot.backtest.metrics.compute_metrics`) ;
+    #: ``buy_hold_return`` = buy & hold net sur la période OOS (règle 8 du moteur)
     oos_metrics: dict[str, float | int]
-    #: moyenne de la métrique d'optimisation sur les fenêtres d'entraînement
+    #: moyenne de la métrique d'optimisation sur les fenêtres d'entraînement, pondérée par
+    #: le nombre de bougies de test de chaque fenêtre (valeurs non finies ignorées)
     is_metrics_mean: float
-    #: moyenne de la métrique d'optimisation sur les fenêtres de test
+    #: idem sur les fenêtres de test
     oos_metrics_mean: float
-    #: ``oos_metrics_mean / is_metrics_mean`` (NaN si la moyenne IS n'est pas > 0)
+    #: ratio de sur-apprentissage (:func:`_overfit_ratio` ; NaN s'il n'a pas de sens)
     overfit_ratio: float
     strategy_name: str = ""
     metric: str = "sharpe"
@@ -354,6 +487,26 @@ class WalkForwardResult:
     #: ``pnl`` est exprimé par rapport au capital initial de chaque fenêtre
     oos_trades: pd.DataFrame = field(default_factory=pd.DataFrame)
     periods_per_year: float = 365.0
+    #: aller-retours forcés par les bornes de fenêtres : sortie « end » à la dernière bougie
+    #: d'une fenêtre suivie d'une ré-entrée du même côté à la première ouverture tradable de
+    #: la suivante (la position n'est pas portée d'une fenêtre à l'autre)
+    n_boundary_reopens: int = 0
+    #: frais de ces aller-retours (jambe de sortie + jambe de ré-entrée), déjà inclus dans
+    #: ``oos_equity`` ; le glissement n'est pas compté
+    boundary_fees: float = 0.0
+    #: drawdown maximal autorisé (``RiskConfig.max_drawdown``) utilisé pour la vérification
+    #: après coup de la courbe OOS enchaînée (None = kill switch désactivé)
+    max_drawdown_limit: float | None = None
+    #: première bougie où la courbe OOS enchaînée dépasse ``max_drawdown_limit`` (en réel le
+    #: kill switch aurait arrêté le robot là) ; None si jamais
+    oos_kill_switch_time: pd.Timestamp | None = None
+    #: drawdown (fraction positive) de la courbe OOS à cet instant
+    oos_kill_switch_drawdown: float = 0.0
+    #: nombre de fenêtres de test où le kill switch du moteur s'est déclenché (il repart de
+    #: zéro à chaque fenêtre)
+    n_window_kill_switches: int = 0
+    #: False si la limite de perte journalière était inactive (bougies >= 1 jour)
+    daily_limit_active: bool = True
 
     @property
     def n_windows(self) -> int:
@@ -369,6 +522,46 @@ class WalkForwardResult:
             row["best_params"] = _fmt_params(w.get("best_params", {}))
             rows.append(row)
         return pd.DataFrame(rows)
+
+    def _excluded_from_means(self) -> tuple[int, int]:
+        """(fenêtres IS, fenêtres OOS) écartées des moyennes (métrique infinie / indéfinie)."""
+        n_is = sum(
+            1 for w in self.windows if not math.isfinite(float(w.get("is_metric", math.nan)))
+        )
+        n_oos = sum(
+            1 for w in self.windows if not math.isfinite(float(w.get("oos_metric", math.nan)))
+        )
+        return n_is, n_oos
+
+    def guard_rails_lines(self) -> list[str]:
+        """Lignes « garde-fous » du résumé : kill switch après coup, limite journalière."""
+        lines: list[str] = []
+        if self.oos_kill_switch_time is not None and self.max_drawdown_limit:
+            lines.append(
+                f"⚠ En réel, le kill switch (drawdown max "
+                f"{_fmt_pct(self.max_drawdown_limit, signed=False)}) aurait arrêté le robot le "
+                f"{_fmt_ts(self.oos_kill_switch_time)} (baisse de "
+                f"{_fmt_pct(self.oos_kill_switch_drawdown, signed=False)} depuis le sommet de la "
+                "courbe OOS) : tout ce qui suit cette date n'aurait pas été tradé. Ici le kill "
+                "switch et la limite journalière repartent de zéro à chaque fenêtre."
+            )
+        elif self.max_drawdown_limit:
+            lines.append(
+                f"Kill switch (drawdown max {_fmt_pct(self.max_drawdown_limit, signed=False)}) : "
+                "la courbe OOS enchaînée ne l'aurait pas déclenché (vérification après coup ; "
+                "il repart de zéro à chaque fenêtre)."
+            )
+        if self.n_window_kill_switches:
+            lines.append(
+                f"Kill switch déclenché à l'intérieur de {self.n_window_kill_switches} "
+                "fenêtre(s) de test (le robot y a cessé de trader jusqu'à la fin de la fenêtre)."
+            )
+        if not self.daily_limit_active:
+            lines.append(
+                "Limite de perte journalière inactive : bougies >= 1 jour (elle n'a de sens "
+                "qu'en intrajournalier)."
+            )
+        return lines
 
     def summary(self) -> str:
         """Compte rendu texte en français : fenêtres, équité OOS et ratio de sur-apprentissage."""
@@ -400,6 +593,10 @@ class WalkForwardResult:
                 f"{_fmt_num(w.get('oos_metric', math.nan)):>12} | "
                 f"{_fmt_params(w.get('best_params', {}))}"
             )
+        lines.append(
+            "Métriques IS et OOS calculées sur la même base : historique de chauffe fourni, "
+            "bougies de chauffe exclues."
+        )
         lines.append("")
         if len(self.oos_equity):
             lines.append(
@@ -411,8 +608,26 @@ class WalkForwardResult:
             )
             if "buy_hold_return" in m:
                 lines.append(
-                    f"Buy & hold sur la même période OOS : {_fmt_pct(m['buy_hold_return'])}"
+                    f"Buy & hold sur la même période OOS, frais inclus : "
+                    f"{_fmt_pct(m['buy_hold_return'])}"
                 )
+        if self.n_windows > 1:
+            note = (
+                "Note : la position est fermée à la fin de chaque fenêtre de test et rouverte "
+                "au début de la suivante"
+            )
+            if self.n_boundary_reopens:
+                note += (
+                    f" ({self.n_boundary_reopens} aller-retour(s) forcé(s), "
+                    f"≈ {_fmt_money(self.boundary_fees)} de frais inclus dans l'équité OOS et "
+                    f"{self.n_boundary_reopens} trade(s) de plus)"
+                )
+            note += (
+                " : des fenêtres de test courtes pénalisent les stratégies qui gardent "
+                "longtemps leurs positions."
+            )
+            lines.append(note)
+        lines.extend(self.guard_rails_lines())
         label_w = len(f"Moyenne OOS ({self.metric})")
         lines.append(
             f"{f'Moyenne IS ({self.metric})':<{label_w}} : {_fmt_num(self.is_metrics_mean)}"
@@ -421,13 +636,71 @@ class WalkForwardResult:
             f"{f'Moyenne OOS ({self.metric})':<{label_w}} : {_fmt_num(self.oos_metrics_mean)}"
         )
         lines.append(f"{'Ratio OOS / IS':<{label_w}} : {_fmt_num(self.overfit_ratio)}")
+        n_is, n_oos = self._excluded_from_means()
+        pond = "Moyennes pondérées par le nombre de bougies de test de chaque fenêtre"
+        if n_is or n_oos:
+            pond += f" ; fenêtres écartées (valeur infinie ou indéfinie) : {n_is} IS, {n_oos} OOS"
+        lines.append(pond + ".")
         lines.append(
             "Lecture : un ratio proche de 1 signifie que la stratégie se comporte hors "
             "échantillon comme en échantillon (robuste) ; un ratio très inférieur à 1, nul ou "
             "négatif révèle du sur-apprentissage (les paramètres optimisés ne généralisent "
-            "pas) ; n/d = moyenne IS nulle ou négative, le ratio n'a pas de sens."
+            "pas) ; supérieur à 1 = mieux hors échantillon (rare, souvent le hasard). Pour une "
+            "métrique négative comme max_drawdown, le ratio vaut |IS| / |OOS| (même lecture). "
+            "n/d = moyenne IS nulle, infinie ou de signe opposé à la moyenne OOS : le ratio n'a "
+            "pas de sens."
         )
         return "\n".join(lines)
+
+
+def _boundary_reopens(
+    trades_by_window: list[pd.DataFrame],
+    bounds: list[tuple[int, int]],
+    index: pd.Index,
+    fee_rate: float,
+) -> tuple[int, float]:
+    """Compte les aller-retours forcés par les bornes de fenêtres et leurs frais.
+
+    Un aller-retour forcé = un trade sorti « end » à la dernière bougie de la fenêtre ``k``
+    suivi d'un trade du même côté entré à la première ouverture tradable de la fenêtre
+    ``k+1`` (``test_start + 1``). Frais = jambe de sortie + jambe de ré-entrée.
+    """
+    n = 0
+    fees = 0.0
+    for k in range(len(bounds) - 1):
+        prev, nxt = trades_by_window[k], trades_by_window[k + 1]
+        if not len(prev) or not len(nxt):
+            continue
+        _s0, e0 = bounds[k]
+        s1, e1 = bounds[k + 1]
+        last = prev.iloc[-1]
+        first = nxt.iloc[0]
+        reentry_pos = min(s1 + 1, e1 - 1)
+        if (
+            str(last.get("exit_reason")) == "end"
+            and pd.Timestamp(last.get("exit_time")) == index[e0 - 1]
+            and pd.Timestamp(first.get("entry_time")) == index[reentry_pos]
+            and int(last.get("side", 0)) == int(first.get("side", 0))
+        ):
+            n += 1
+            fees += float(last.get("size", 0.0)) * float(last.get("exit_price", 0.0)) * fee_rate
+            fees += float(first.get("size", 0.0)) * float(first.get("entry_price", 0.0)) * fee_rate
+    return n, fees
+
+
+def _post_hoc_kill_switch(
+    oos_equity: pd.Series, max_drawdown: float | None
+) -> tuple[pd.Timestamp | None, float]:
+    """(première bougie où le drawdown de ``oos_equity`` dépasse ``max_drawdown``, drawdown
+    à cet instant) ; ``(None, 0.0)`` si jamais ou si la limite est désactivée."""
+    if not max_drawdown or len(oos_equity) == 0:
+        return None, 0.0
+    dd = metrics_mod.drawdown_series(oos_equity)
+    breached = dd[dd < -float(max_drawdown)]
+    if breached.empty:
+        return None, 0.0
+    ts = breached.index[0]
+    return pd.Timestamp(ts), float(-breached.iloc[0])
 
 
 def walk_forward(
@@ -452,12 +725,18 @@ def walk_forward(
       ``test_start = train_bars + k × test_bars``.
 
     Les fenêtres de test couvrent donc exactement les bougies ``[train_bars, n)``, sans
-    chevauchement (la dernière peut être tronquée). Sur chaque fenêtre d'entraînement,
-    :func:`grid_search` choisit les meilleurs paramètres ; le backtest de test est lancé
-    sur ``strategy.warmup_bars()`` bougies d'historique + la fenêtre de test (pour amorcer
-    les indicateurs), puis l'équité et les trades sont restreints à la fenêtre de test. Les
-    rendements des fenêtres de test sont enchaînés à partir de ``config.initial_cash`` pour
-    former :attr:`WalkForwardResult.oos_equity`.
+    chevauchement (la dernière peut être tronquée). Sur chaque fenêtre d'entraînement, la
+    recherche sur grille choisit les meilleurs paramètres ; entraînement et test sont
+    évalués sur la **même base** (:func:`_backtest_window`) : ``strategy.warmup_bars()``
+    bougies d'historique avant la fenêtre quand elles existent, équité et trades restreints
+    à la fenêtre, métrique calculée à partir de la première bougie de décision (chauffe
+    exclue). Les rendements des fenêtres de test sont enchaînés à partir de
+    ``config.initial_cash`` pour former :attr:`WalkForwardResult.oos_equity` ; la position
+    n'est pas portée d'une fenêtre à l'autre (fermée « end », rouverte à la fenêtre
+    suivante : compté dans ``n_boundary_reopens`` / ``boundary_fees``). Les moyennes IS /
+    OOS sont pondérées par ``n_test_bars``. Après enchaînement, la courbe OOS est vérifiée
+    contre ``RiskConfig.max_drawdown`` (``oos_kill_switch_time``) car le kill switch du
+    moteur repart de zéro à chaque fenêtre.
 
     :param train_bars: taille de la fenêtre d'entraînement (obligatoire).
     :param test_bars: taille de la fenêtre de test et pas d'avancement (obligatoire).
@@ -502,9 +781,13 @@ def walk_forward(
     returns_parts: list[pd.Series] = []
     positions_parts: list[pd.Series] = []
     trades_parts: list[pd.DataFrame] = []
+    trades_by_window: list[pd.DataFrame] = []
+    bounds: list[tuple[int, int]] = []
     empty_trades: pd.DataFrame | None = None
     ppy = 365.0
     warned_warmup = False
+    n_window_kill_switches = 0
+    daily_limit_active = True
 
     test_start = train_bars
     while test_start < n:
@@ -512,10 +795,9 @@ def walk_forward(
         train_start = 0 if anchored else test_start - train_bars
         train_end = test_start
         test_end = min(test_start + test_bars, n)
-        train_df = data.iloc[train_start:train_end]
 
         table, ranked = _evaluate_grid(
-            train_df, strategy_cls, combos, cfg, risk, metric, param_names
+            data, strategy_cls, combos, cfg, risk, metric, param_names, train_start, train_end
         )
         if not ranked:
             raise RuntimeError(
@@ -535,29 +817,22 @@ def walk_forward(
                 warmup,
                 train_bars,
             )
-        hist_start = max(0, test_start - warmup)
-        test_df = data.iloc[hist_start:test_end]
-        result = run_backtest(test_df, strategy, config=cfg, risk=risk)
+        run = _backtest_window(data, strategy, test_start, test_end, cfg, risk)
+        result = run.result
         ppy = float(result.periods_per_year)
-        offset = test_start - hist_start
-
-        equity = result.equity.iloc[offset:]
+        if k == 1:
+            daily_limit_active = bool(getattr(result, "daily_limit_active", True))
+        equity = run.equity
         rets = equity.pct_change().fillna(0.0)
         rets.name = "returns"
-        positions = result.positions.iloc[offset:]
-        trades = result.trades
+        positions = run.positions
+        trades = run.trades
         if empty_trades is None:
-            empty_trades = trades.iloc[0:0].copy()
-        if len(trades):
-            trades = trades.loc[trades["entry_time"] >= equity.index[0]]
-        oos_m = metrics_mod.compute_metrics(
-            equity,
-            trades,
-            ppy,
-            benchmark=test_df["close"].iloc[offset:],
-            positions=positions,
-        )
+            empty_trades = result.trades.iloc[0:0].copy()
+        oos_m = run.metrics
         oos_metric = float(oos_m.get(metric, math.nan))
+        window_kill = bool(oos_m.get("kill_switch_triggered", 0))
+        n_window_kill_switches += int(window_kill)
 
         windows.append(
             {
@@ -576,6 +851,7 @@ def walk_forward(
                 "n_test_bars": int(test_end - test_start),
                 "n_oos_trades": int(len(trades)),
                 "oos_return": float(oos_m.get("total_return", 0.0)),
+                "oos_kill_switch": window_kill,
             }
         )
         logger.info(
@@ -596,6 +872,8 @@ def walk_forward(
         )
         returns_parts.append(rets)
         positions_parts.append(positions)
+        trades_by_window.append(trades)
+        bounds.append((int(test_start), int(test_end)))
         if len(trades):
             trades_parts.append(trades.assign(window=k))
         test_start += test_bars
@@ -619,18 +897,44 @@ def walk_forward(
         benchmark=data["close"].iloc[train_bars:],
         positions=oos_positions,
     )
-    is_mean = _finite_mean(w["is_metric"] for w in windows)
-    oos_mean = _finite_mean(w["oos_metric"] for w in windows)
+    # Buy & hold net sur la période OOS : première ouverture tradable → dernière clôture.
+    first_tradable = min(train_bars + 1, n - 1)
+    oos_metrics["buy_hold_return"] = _net_buy_hold_return(
+        float(data["open"].iloc[first_tradable]),
+        float(data["close"].iloc[-1]),
+        float(cfg.fee_rate),
+        float(cfg.slippage),
+    )
+    weights = [float(w["n_test_bars"]) for w in windows]
+    is_mean = _finite_mean((w["is_metric"] for w in windows), weights)
+    oos_mean = _finite_mean((w["oos_metric"] for w in windows), weights)
     ratio = _overfit_ratio(is_mean, oos_mean)
+    n_reopens, boundary_fees = _boundary_reopens(
+        trades_by_window, bounds, data.index, float(cfg.fee_rate)
+    )
+    risk_cfg = getattr(risk, "config", None) if risk is not None else RiskConfig()
+    max_dd_limit = getattr(risk_cfg, "max_drawdown", None)
+    max_dd_limit = float(max_dd_limit) if max_dd_limit else None
+    kill_time, kill_dd = _post_hoc_kill_switch(oos_equity, max_dd_limit)
+    if kill_time is not None:
+        logger.warning(
+            "Walk-forward %s : la courbe OOS enchaînée dépasse le drawdown maximal autorisé "
+            "(%.1f %% > %.0f %%) le %s : en réel, le kill switch aurait arrêté le robot là",
+            name,
+            kill_dd * 100,
+            (max_dd_limit or 0.0) * 100,
+            kill_time.isoformat(),
+        )
     logger.info(
         "Walk-forward terminé : %d fenêtres, rendement OOS %s, %s IS moyen %s, OOS moyen %s, "
-        "ratio %s",
+        "ratio %s, %d aller-retour(s) aux bornes de fenêtres",
         len(windows),
         _fmt_pct(oos_metrics.get("total_return", 0.0)),
         metric,
         _fmt_num(is_mean),
         _fmt_num(oos_mean),
         _fmt_num(ratio),
+        n_reopens,
     )
     return WalkForwardResult(
         windows=windows,
@@ -648,4 +952,11 @@ def walk_forward(
         oos_positions=oos_positions,
         oos_trades=oos_trades,
         periods_per_year=ppy,
+        n_boundary_reopens=n_reopens,
+        boundary_fees=boundary_fees,
+        max_drawdown_limit=max_dd_limit,
+        oos_kill_switch_time=kill_time,
+        oos_kill_switch_drawdown=kill_dd,
+        n_window_kill_switches=n_window_kill_switches,
+        daily_limit_active=daily_limit_active,
     )

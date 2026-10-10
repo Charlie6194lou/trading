@@ -59,6 +59,8 @@ DEMO_SEED = 42
 DEFAULT_CACHE_DIR = "data/cache"
 #: nombre de bougies demandées à l'exchange à chaque itération en paper / live
 DEFAULT_LOOKBACK = 500
+#: fichier du compte fictif, dans le répertoire d'état de la boucle paper
+PAPER_ACCOUNT_FILE = "account.json"
 #: marge de bougies au-delà de la période de chauffe pour le paper / live
 LOOKBACK_MARGIN = 50
 #: phrase affichée par la démo : les données synthétiques ne prouvent rien
@@ -647,9 +649,10 @@ def cmd_paper(args: argparse.Namespace) -> int:
     name = args.strategy or settings.strategy.name
     strategy = _make_strategy(name, _strategy_params(args, settings, name))
     risk = _risk_manager(args, settings)
-    base_dir = Path(args.state_dir or settings.general.state_dir)
     state_dir = _trader_state_dir(settings, args, "paper", exchange_id, symbol, timeframe)
-    broker_state = base_dir / f"paper_{_safe_name(exchange_id)}_{_safe_name(symbol)}.json"
+    # Un compte fictif PAR boucle (exchange + symbole + timeframe), dans le répertoire d'état
+    # de la boucle : deux paper tradings sur le même symbole ne partagent jamais un compte.
+    broker_state = state_dir / PAPER_ACCOUNT_FILE
     initial_cash = (
         float(args.initial_cash) if args.initial_cash is not None else settings.initial_cash
     )
@@ -774,6 +777,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         lookback=_trading_lookback(args, strategy),
         notifier=_build_notifier(settings),
         allow_short=risk.config.allow_short,
+        adopt_existing_position=bool(getattr(args, "adopt_position", False)),
     )
     balance = broker.get_balance(symbol)
     _print(

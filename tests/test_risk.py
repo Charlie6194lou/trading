@@ -133,10 +133,87 @@ def test_invalid_config_rejected() -> None:
     with pytest.raises(ValueError):
         RiskManager(RiskConfig(max_position_fraction=-1))
     with pytest.raises(ValueError):
+        RiskManager(RiskConfig(default_stop_atr_mult=0.0))
+    with pytest.raises(ValueError):
+        RiskManager(RiskConfig(default_stop_pct=1.0))
+    with pytest.raises(ValueError):
+        RiskManager(RiskConfig(default_stop_pct=0.0))
+    with pytest.raises(ValueError):
         RiskManager(RiskConfig(max_drawdown=-0.1))
     with pytest.raises(ValueError):
         RiskManager(RiskConfig(vol_target=0.0))
     assert RiskManager().config == RiskConfig()  # config par défaut acceptée
+
+
+@pytest.mark.parametrize("fraction", [1.01, 2.0, 95.0, math.inf])
+def test_max_position_fraction_above_one_is_rejected_in_french(fraction: float) -> None:
+    """F8 : au-delà de 1 (tout le capital) le sizing demande du levier et chaque ordre
+    échoue sur « fonds insuffisants » ; on refuse dès la configuration."""
+    with pytest.raises(ValueError, match="max_position_fraction.*entre 0.*et 1"):
+        RiskManager(RiskConfig(max_position_fraction=fraction))
+
+
+def test_max_position_fraction_one_is_accepted() -> None:
+    rm = manager(max_position_fraction=1.0)
+    assert rm.position_size(10_000, 100) == pytest.approx(100.0)
+
+
+def test_default_stop_fields_defaults() -> None:
+    cfg = RiskConfig()
+    assert cfg.default_stop_atr_mult == 3.0
+    assert cfg.default_stop_pct == 0.05
+    assert "default_stop_atr_mult" in RiskManager(cfg).state()["config"]
+
+
+# ============================================================================ stop protecteur
+def test_protective_stop_uses_strategy_stop_when_on_the_right_side() -> None:
+    rm = manager()
+    assert rm.protective_stop(1, 100.0, strategy_stop=95.0, atr=2.0) == 95.0
+    assert rm.protective_stop(-1, 100.0, strategy_stop=105.0, atr=2.0) == 105.0
+    # stop_loss_pct fourni mais le stop de stratégie reste prioritaire
+    assert rm.protective_stop(1, 100.0, strategy_stop=95.0, atr=2.0, stop_loss_pct=0.02) == 95.0
+
+
+def test_protective_stop_wrong_side_or_nan_falls_through_to_pct_then_atr() -> None:
+    rm = manager()
+    # Stop long au-dessus du prix : ignoré → stop_loss_pct 2 % → 98.
+    assert rm.protective_stop(1, 100.0, strategy_stop=105.0, atr=2.0, stop_loss_pct=0.02) == 98.0
+    # Stop court sous le prix : ignoré → 102.
+    assert rm.protective_stop(-1, 100.0, strategy_stop=95.0, atr=2.0, stop_loss_pct=0.02) == 102.0
+    # Stop égal au prix : pas du bon côté strict → ATR : 100 − 3×2 = 94.
+    assert rm.protective_stop(1, 100.0, strategy_stop=100.0, atr=2.0) == 94.0
+    # Pas de stop du tout, pas de pct (None / 0) → ATR.
+    assert rm.protective_stop(1, 100.0, atr=2.0) == 94.0
+    assert rm.protective_stop(1, 100.0, strategy_stop=math.nan, atr=2.0, stop_loss_pct=0.0) == 94.0
+    assert rm.protective_stop(-1, 100.0, atr=2.0) == 106.0
+    rm2 = manager(default_stop_atr_mult=2.5)
+    assert rm2.protective_stop(1, 100.0, atr=2.0) == 95.0
+
+
+def test_protective_stop_last_resort_pct_when_atr_missing_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="tradingbot.risk")
+    rm = manager()
+    assert rm.protective_stop(1, 100.0) == pytest.approx(95.0)
+    assert rm.protective_stop(1, 100.0, atr=math.nan) == pytest.approx(95.0)
+    assert rm.protective_stop(1, 100.0, atr=0.0) == pytest.approx(95.0)
+    assert rm.protective_stop(-1, 100.0) == pytest.approx(105.0)
+    rm2 = manager(default_stop_pct=0.10)
+    assert rm2.protective_stop(1, 200.0) == pytest.approx(180.0)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 5
+    assert all("dernier recours" in r.getMessage() for r in warnings)
+
+
+def test_protective_stop_rejects_invalid_side_or_price() -> None:
+    rm = manager()
+    with pytest.raises(ValueError, match="side"):
+        rm.protective_stop(0, 100.0)
+    with pytest.raises(ValueError, match="price"):
+        rm.protective_stop(1, 0.0)
+    with pytest.raises(ValueError, match="price"):
+        rm.protective_stop(1, math.nan)
 
 
 # ============================================================================ kill switch
@@ -223,6 +300,71 @@ def test_daily_limit_without_update_is_pure_check() -> None:
     assert rm.daily_limit_hit(at(1), 9_000)
     assert not rm.state()["daily_locked"]
     assert not rm.daily_limit_hit(at(1), 9_900)
+
+
+def test_daily_limit_can_be_deactivated_by_the_caller() -> None:
+    """M1 : sur des bougies >= 1 jour l'appelant désactive la limite ; elle ne se verrouille
+    jamais et can_open ne la vérifie plus. Le choix n'est ni sérialisé ni effacé par reset."""
+    rm = manager(daily_loss_limit=0.05, max_drawdown=None)
+    assert rm.daily_limit_active
+    rm.set_daily_limit_active(False, "bougies >= 1 jour")
+    assert not rm.daily_limit_active
+    assert rm.daily_limit_inactive_reason == "bougies >= 1 jour"
+    rm.update(at(0), 10_000)
+    rm.update(at(1), 9_000)  # -10 % : aurait verrouillé
+    assert not rm.daily_limit_hit(at(1), 9_000)
+    assert rm.can_open(1, at(1), 9_000) == (True, "ok")
+    assert rm.state()["daily_locked"] is False
+    assert "daily_limit_active" not in rm.state()
+    rm.reset()
+    assert not rm.daily_limit_active
+    # Réactivation : la limite fonctionne à nouveau normalement.
+    rm.set_daily_limit_active(True)
+    assert rm.daily_limit_active and rm.daily_limit_inactive_reason == ""
+    rm.update(at(2), 10_000)
+    rm.update(at(3), 9_000)
+    assert rm.daily_limit_hit(at(3), 9_000)
+    assert not rm.can_open(1, at(3), 9_000)[0]
+    # Désactiver lève un verrou déjà posé.
+    rm.set_daily_limit_active(False, "test")
+    assert not rm.daily_limit_hit(at(3), 9_000)
+    assert "daily_limit_active=False" in repr(rm)
+
+
+def test_daily_reference_after_multi_day_gap_is_current_equity() -> None:
+    """F12 : après un redémarrage plusieurs jours plus tard, la dernière équité connue ne
+    décrit plus le début du jour : on repart de l'équité courante."""
+    rm = manager(daily_loss_limit=0.05, max_drawdown=None)
+    rm.update(pd.Timestamp("2024-01-01 10:00", tz="UTC"), 10_000)
+    rm.update(pd.Timestamp("2024-01-01 23:00", tz="UTC"), 9_800)
+    rm2 = manager(daily_loss_limit=0.05, max_drawdown=None)
+    rm2.load_state(rm.state())
+    rm2.update(pd.Timestamp("2024-01-04 09:00", tz="UTC"), 9_400)
+    assert rm2.day_start_equity == 9_400  # et non 9 800 (vieux de 3 jours)
+    rm2.update(pd.Timestamp("2024-01-04 10:00", tz="UTC"), 9_300)  # -1,1 % sur la journée
+    assert not rm2.daily_limit_hit(pd.Timestamp("2024-01-04 10:00", tz="UTC"), 9_300)
+    # Sens inverse : gain pendant l'arrêt → la référence trop basse n'affaiblit plus la limite.
+    rm3 = manager(daily_loss_limit=0.05, max_drawdown=None)
+    rm3.load_state(rm.state())
+    rm3.update(pd.Timestamp("2024-01-04 09:00", tz="UTC"), 10_800)
+    assert rm3.day_start_equity == 10_800
+    rm3.update(pd.Timestamp("2024-01-04 12:00", tz="UTC"), 10_200)  # -5,6 % sur la journée
+    assert rm3.daily_limit_hit(pd.Timestamp("2024-01-04 12:00", tz="UTC"), 10_200)
+    # Sans trou (23:00 → 00:00), la référence reste la dernière équité de la veille.
+    rm4 = manager(daily_loss_limit=0.05, max_drawdown=None)
+    rm4.update(pd.Timestamp("2024-01-01 23:00", tz="UTC"), 9_800)
+    rm4.update(pd.Timestamp("2024-01-02 00:00", tz="UTC"), 9_700)
+    assert rm4.day_start_equity == 9_800
+    # Bougies journalières (écart exactement 1 jour) : la veille reste la référence.
+    rm5 = manager(daily_loss_limit=0.05, max_drawdown=None)
+    rm5.update(pd.Timestamp("2024-01-01", tz="UTC"), 9_800)
+    rm5.update(pd.Timestamp("2024-01-02", tz="UTC"), 9_700)
+    assert rm5.day_start_equity == 9_800
+    # Premier update après load_state sans horodatage mémorisé : équité courante.
+    rm6 = manager(daily_loss_limit=0.05, max_drawdown=None)
+    rm6.load_state({"last_equity": 5_000.0, "day": "2024-01-01"})
+    rm6.update(pd.Timestamp("2024-01-02 08:00", tz="UTC"), 9_000)
+    assert rm6.day_start_equity == 9_000
 
 
 def test_daily_limit_disabled() -> None:

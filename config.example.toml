@@ -22,8 +22,10 @@ initial_cash = 1000.0       # capital de départ (paper) ou capital de référen
 risk_per_trade = 0.01       # perte max acceptée par trade : 1 % du capital
 max_position_fraction = 0.95   # jamais plus de 95 % du capital sur une position
 max_drawdown = 0.20         # arrêt automatique si le capital perd 20 % depuis son plus haut
-daily_loss_limit = 0.05     # arrêt de la journée si -5 % sur la journée
+daily_loss_limit = 0.05     # arrêt de la journée si -5 % sur la journée (bougies < 1 jour seulement)
 allow_short = false         # la vente à découvert est désactivée (spot)
+default_stop_atr_mult = 3.0 # stop de secours = 3 × ATR(14) si la stratégie n'en donne pas
+default_stop_pct = 0.05     # stop de dernier recours 5 % du prix si l'ATR est indisponible
 
 [costs]
 fee_rate = 0.001            # 0.1 % de frais par ordre (tarif courant sur Binance spot)

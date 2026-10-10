@@ -17,10 +17,11 @@ import pytest
 from conftest import make_ohlcv
 
 from tradingbot.backtest.engine import BacktestConfig, run_backtest
-from tradingbot.backtest.metrics import METRIC_KEYS
+from tradingbot.backtest.metrics import METRIC_KEYS, compute_metrics
 from tradingbot.backtest.walkforward import (
     WINDOW_KEYS,
     WalkForwardResult,
+    _finite_mean,
     _overfit_ratio,
     _sort_table,
     default_windows,
@@ -103,6 +104,23 @@ class AlwaysLong(Strategy):
         return out
 
 
+class AlwaysLongW(Strategy):
+    """Toujours long, mais avec une période de chauffe paramétrable (F51)."""
+
+    name = "always_long_w"
+    description = "toujours long après w bougies de chauffe"
+    default_params = {"w": 10}
+    param_grid = {"w": [10]}
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = self.empty_signals(df)
+        out["signal"] = np.ones(len(df), dtype=np.int64)
+        return out
+
+    def warmup_bars(self) -> int:
+        return int(self.params["w"])
+
+
 class Recording(Strategy):
     """Ne trade jamais mais mémorise les tranches de bougies reçues."""
 
@@ -137,22 +155,30 @@ class Failing(Strategy):
 
 
 def frictionless() -> tuple[BacktestConfig, RiskManager]:
-    """Pas de frais, pas de glissement, 100 % du capital investi, aucun garde-fou."""
+    """Pas de frais, pas de glissement, 100 % du capital investi, aucun garde-fou.
+
+    Une position ne s'ouvre jamais sans stop : le stop de dernier recours est placé très
+    loin (99 % du prix) avec ``risk_per_trade = 1`` pour que la taille sature toujours
+    ``max_position_fraction`` (= tout le capital).
+    """
     cfg = BacktestConfig(initial_cash=CASH, fee_rate=0.0, slippage=0.0)
     risk = RiskManager(
         RiskConfig(
+            risk_per_trade=1.0,
             max_position_fraction=1.0,
             max_drawdown=None,
             daily_loss_limit=None,
             min_trade_notional=0.0,
+            default_stop_pct=0.99,
         )
     )
     return cfg, risk
 
 
-def staircase(n: int = 12, start: float = 100.0) -> pd.DataFrame:
-    """Clôtures 100, 101, 102… ; ``open[t] = close[t-1]`` (pas de gap)."""
-    close = start + np.arange(n, dtype=float)
+def staircase(n: int = 12, start: float = 100.0, step: float = 1.0) -> pd.DataFrame:
+    """Clôtures 100, 101, 102… (ou décroissantes si ``step < 0``) ; ``open[t] = close[t-1]``
+    (pas de gap)."""
+    close = start + step * np.arange(n, dtype=float)
     open_ = np.concatenate([[start], close[:-1]])
     high = np.maximum(open_, close) + 0.5
     low = np.minimum(open_, close) - 0.5
@@ -187,12 +213,23 @@ def test_grid_search_one_row_per_combination_sorted(bars: pd.DataFrame) -> None:
     sharpe = table["sharpe"].to_numpy()
     assert np.all(np.diff(sharpe) <= 0)
     assert list(table.index) == [0, 1, 2, 3]
-    # chaque ligne reproduit exactement le backtest de sa combinaison
+    # chaque ligne reproduit le backtest de sa combinaison ; les métriques sont calculées à
+    # partir de la fin de la chauffe (F51) : rendement, drawdown et nombre de trades sont
+    # identiques à run_backtest, le Sharpe n'est plus dilué par les bougies plates de chauffe
     for _, row in table.iterrows():
-        res = run_backtest(bars, SmaCrossTest(fast=int(row["fast"]), slow=int(row["slow"])))
+        strat = SmaCrossTest(fast=int(row["fast"]), slow=int(row["slow"]))
+        res = run_backtest(bars, strat)
+        w = strat.warmup_bars()
         assert row["total_return"] == res.metrics["total_return"]
-        assert row["sharpe"] == res.metrics["sharpe"]
+        assert row["max_drawdown"] == res.metrics["max_drawdown"]
         assert row["n_trades"] == res.metrics["n_trades"]
+        trimmed = compute_metrics(
+            res.equity.iloc[w:], res.trades, res.periods_per_year, positions=res.positions.iloc[w:]
+        )
+        assert row["sharpe"] == pytest.approx(trimmed["sharpe"])
+        assert row["exposure"] == pytest.approx(trimmed["exposure"])
+        if res.metrics["n_trades"]:
+            assert row["sharpe"] != res.metrics["sharpe"]
 
 
 def test_grid_search_explicit_grid_and_scalar_values(bars: pd.DataFrame) -> None:
@@ -533,11 +570,47 @@ def test_walk_forward_warmup_longer_than_train_warns(
 def test_overfit_ratio() -> None:
     assert _overfit_ratio(1.0, 0.5) == pytest.approx(0.5)
     assert _overfit_ratio(2.0, 2.0) == pytest.approx(1.0)
+    assert _overfit_ratio(1.0, -0.5) == pytest.approx(-0.5)  # OOS négatif : ratio négatif
     assert math.isnan(_overfit_ratio(0.0, 0.5))
-    assert math.isnan(_overfit_ratio(-1.0, 0.5))
+    assert math.isnan(_overfit_ratio(-1.0, 0.5))  # signes opposés : pas de sens
+    assert math.isnan(_overfit_ratio(-1.0, 0.0))
     assert math.isnan(_overfit_ratio(math.nan, 0.5))
     assert math.isnan(_overfit_ratio(1.0, math.nan))
     assert math.isnan(_overfit_ratio(math.inf, 1.0))
+    assert math.isnan(_overfit_ratio(2.0, math.inf))  # F56 : inf n'est plus propagé
+    # F56 : métrique négative « plus grand = mieux » (max_drawdown) : |IS| / |OOS|
+    assert _overfit_ratio(-0.0749, -0.0751) == pytest.approx(0.0749 / 0.0751)
+    assert _overfit_ratio(-0.05, -0.10) == pytest.approx(0.5)  # OOS deux fois pire
+    assert _overfit_ratio(-0.10, -0.05) == pytest.approx(2.0)  # OOS deux fois meilleur
+
+
+def test_finite_mean_skips_inf_and_weights() -> None:
+    assert _finite_mean([1.0, 3.0]) == pytest.approx(2.0)
+    assert _finite_mean([math.inf, 2.0]) == pytest.approx(2.0)  # F56
+    assert _finite_mean([math.nan, 2.0, -math.inf]) == pytest.approx(2.0)
+    assert math.isnan(_finite_mean([math.nan, math.inf]))
+    assert math.isnan(_finite_mean([]))
+    # F57 : pondération ; poids nuls ignorés
+    assert _finite_mean([1.0, 3.0], [3.0, 1.0]) == pytest.approx(1.5)
+    assert _finite_mean([1.0, 3.0, 100.0], [1.0, 1.0, 0.0]) == pytest.approx(2.0)
+    assert _finite_mean([math.inf, 3.0], [10.0, 1.0]) == pytest.approx(3.0)
+
+
+def test_walk_forward_max_drawdown_metric_has_a_ratio() -> None:
+    """F56 : max_drawdown est documentée comme métrique valide : le ratio n'est plus n/d."""
+    df = staircase(16)
+    cfg, risk = frictionless()
+    result = walk_forward(
+        df, AlwaysLong, train_bars=8, test_bars=4, config=cfg, risk=risk, metric="max_drawdown"
+    )
+    assert result.metric == "max_drawdown"
+    # escalier montant : aucun drawdown, moyennes nulles → ratio sans objet
+    assert result.is_metrics_mean == 0.0 and math.isnan(result.overfit_ratio)
+    bars = make_ohlcv(n=300, seed=21, vol=0.02)
+    result = walk_forward(bars, AlwaysLong, train_bars=100, test_bars=50, metric="max_drawdown")
+    assert result.is_metrics_mean < 0 and result.oos_metrics_mean < 0
+    assert result.overfit_ratio == pytest.approx(result.is_metrics_mean / result.oos_metrics_mean)
+    assert "n/d" not in result.summary().split("Ratio OOS / IS")[1].splitlines()[0]
 
 
 def test_summary_is_french_and_explains_ratio() -> None:
@@ -555,6 +628,14 @@ def test_summary_is_french_and_explains_ratio() -> None:
     assert "Lecture" in text and "sur-apprentissage" in text and "robuste" in text
     assert "dummy=1" in text
     assert "Équité OOS" in text
+    assert "Buy & hold sur la même période OOS, frais inclus" in text
+    assert "même base" in text
+    assert "Moyennes pondérées par le nombre de bougies de test" in text
+    assert "la position est fermée à la fin de chaque fenêtre de test" in text
+    assert "max_drawdown, le ratio vaut |IS| / |OOS|" in text
+    assert "⚠" not in text  # aucun kill switch : pas d'avertissement
+    assert "ne l'aurait pas déclenché" not in text  # kill switch désactivé dans frictionless()
+    assert "inactive" not in text
     frame = result.windows_frame()
     assert len(frame) == 2
     assert frame.loc[0, "best_params"] == "dummy=1"
@@ -570,6 +651,207 @@ def test_walk_forward_accepts_unsorted_input(bars: pd.DataFrame) -> None:
     shuffled = bars.sample(frac=1.0, random_state=0)
     result = walk_forward(shuffled, Recording, train_bars=100, test_bars=50)
     assert result.oos_equity.index.equals(bars.index[100:])
+
+
+# ============================================================================ F51 : même base IS / OOS
+def test_in_sample_metric_uses_warmup_history_like_oos() -> None:
+    """F51 : avec train_bars == test_bars, la fenêtre d'entraînement k+1 est exactement la
+    fenêtre de test k : leurs métriques doivent être identiques (même historique de chauffe,
+    mêmes bougies évaluées)."""
+    df = staircase(60)
+    cfg, risk = frictionless()
+    result = walk_forward(
+        df, AlwaysLongW, train_bars=20, test_bars=20, config=cfg, risk=risk, metric="total_return"
+    )
+    assert [(w["test_start"], w["test_end"]) for w in result.windows] == [(20, 40), (40, 60)]
+    c = df["close"].to_numpy()
+    # IS fenêtre 1 : train [0, 20) sans historique → métrique à partir de la fin de la chauffe
+    # (bougie 10) : entrée à open[11] = close[10] = 110, sortie close[19] = 119
+    assert result.windows[0]["is_metric"] == pytest.approx(c[19] / c[10] - 1)
+    # OOS fenêtre 1 : test [20, 40) avec 10 bougies d'historique : entrée à open[21] = 120
+    assert result.windows[0]["oos_metric"] == pytest.approx(c[39] / c[20] - 1)
+    # IS fenêtre 2 : train [20, 40) avec historique → identique à l'OOS de la fenêtre 1
+    assert result.windows[1]["is_metric"] == pytest.approx(result.windows[0]["oos_metric"])
+    assert result.windows[1]["oos_metric"] == pytest.approx(c[59] / c[40] - 1)
+    assert result.is_metrics_mean == pytest.approx(((c[19] / c[10] - 1) + (c[39] / c[20] - 1)) / 2)
+    # l'équité OOS couvre toujours toutes les bougies de test, plate sur la 1re de chaque fenêtre
+    assert result.oos_equity.index.equals(df.index[20:])
+    assert result.oos_positions.tolist()[:3] == [0, 1, 1]
+    assert result.oos_positions.tolist()[20:23] == [0, 1, 1]
+
+
+def test_in_sample_sharpe_not_diluted_by_warmup(bars: pd.DataFrame) -> None:
+    """F51 : même invariant avec une vraie stratégie et le Sharpe (sensible aux bougies
+    plates) ; avant la correction, l'IS était calculé sur la fenêtre entière, chauffe comprise."""
+    result = walk_forward(
+        bars, SmaCrossTest, grid={"fast": [5], "slow": [20]}, train_bars=75, test_bars=75
+    )
+    assert result.n_windows == 3
+    for k in range(result.n_windows - 1):
+        assert result.windows[k + 1]["is_metric"] == pytest.approx(
+            result.windows[k]["oos_metric"], abs=1e-12
+        )
+        assert result.windows[k]["oos_metric"] != 0.0
+    # repro de la revue : stratégie identique IS et OOS → ratio raisonnable, pas 1,9
+    result = walk_forward(
+        staircase(60),
+        AlwaysLongW,
+        train_bars=20,
+        test_bars=20,
+        config=frictionless()[0],
+        risk=frictionless()[1],
+        metric="total_return",
+    )
+    assert 0.9 < result.overfit_ratio < 1.3
+
+
+# ============================================================================ F57 : moyennes pondérées
+def test_means_weighted_by_test_bars_hand_computed() -> None:
+    """13 bougies, train 4, test 5 : fenêtres de test [4, 9) (5 bougies) et [9, 13) (4)."""
+    df = staircase(13)
+    cfg, risk = frictionless()
+    result = walk_forward(
+        df, AlwaysLong, train_bars=4, test_bars=5, config=cfg, risk=risk, metric="total_return"
+    )
+    assert [w["n_test_bars"] for w in result.windows] == [5, 4]
+    c = df["close"].to_numpy()
+    oos1, oos2 = c[8] / c[4] - 1, c[12] / c[9] - 1
+    is1, is2 = c[3] / c[0] - 1, c[8] / c[5] - 1  # train [0, 4) puis [5, 9)
+    assert result.windows[0]["oos_metric"] == pytest.approx(oos1)
+    assert result.windows[1]["oos_metric"] == pytest.approx(oos2)
+    assert result.windows[0]["is_metric"] == pytest.approx(is1)
+    assert result.windows[1]["is_metric"] == pytest.approx(is2)
+    assert result.oos_metrics_mean == pytest.approx((5 * oos1 + 4 * oos2) / 9)
+    assert result.is_metrics_mean == pytest.approx((5 * is1 + 4 * is2) / 9)
+    assert result.overfit_ratio == pytest.approx(result.oos_metrics_mean / result.is_metrics_mean)
+
+
+# ============================================================================ F52 : bornes de fenêtres
+def test_boundary_reopens_counted_with_fees() -> None:
+    """Toujours long, frais 0,1 % : à la borne entre les deux fenêtres, le trade est fermé
+    « end » à close[7] puis rouvert à open[9] : un aller-retour forcé, deux jambes de frais."""
+    df = staircase(12)
+    _cfg, risk = frictionless()
+    cfg = BacktestConfig(initial_cash=CASH, fee_rate=0.001, slippage=0.0)
+    result = walk_forward(df, AlwaysLong, train_bars=4, test_bars=4, config=cfg, risk=risk)
+    assert result.oos_trades["exit_reason"].tolist() == ["end", "end"]
+    assert result.n_boundary_reopens == 1
+    # fenêtre 1 : achat de 10 000 / (104 × 1.001) unités à 104, revente à 107 (jambe de sortie)
+    qty1 = CASH / (104.0 * 1.001)
+    exit_fee = qty1 * 107.0 * 0.001
+    # fenêtre 2 : achat de 10 000 / (108 × 1.001) unités à 108 (jambe de ré-entrée)
+    qty2 = CASH / (108.0 * 1.001)
+    entry_fee = qty2 * 108.0 * 0.001
+    assert result.boundary_fees == pytest.approx(exit_fee + entry_fee)
+    text = result.summary()
+    assert "1 aller-retour(s) forcé(s)" in text
+    assert f"≈ {exit_fee + entry_fee:.2f} de frais" in text
+    assert "1 trade(s) de plus" in text
+    # stratégie plate : rien à compter
+    flat = walk_forward(df, Recording, train_bars=4, test_bars=4, config=cfg, risk=risk)
+    assert flat.n_boundary_reopens == 0 and flat.boundary_fees == 0.0
+    assert "aller-retour" not in flat.summary()
+    assert "la position est fermée à la fin de chaque fenêtre" in flat.summary()
+    # une seule fenêtre : la note n'a pas lieu d'être
+    single = walk_forward(df, AlwaysLong, train_bars=8, test_bars=4, config=cfg, risk=risk)
+    assert single.n_windows == 1 and "la position est fermée" not in single.summary()
+
+
+def test_oos_buy_hold_is_net_of_costs() -> None:
+    """D8 : le buy & hold OOS part de la première ouverture tradable (open[train_bars + 1])
+    et paie un aller-retour de frais + glissement, comme la stratégie."""
+    df = staircase(12)
+    _cfg, risk = frictionless()
+    cfg = BacktestConfig(initial_cash=CASH, fee_rate=0.001, slippage=0.0005)
+    result = walk_forward(df, AlwaysLong, train_bars=4, test_bars=4, config=cfg, risk=risk)
+    expected = 111.0 * 0.9995 * 0.999 / (104.0 * 1.0005 * 1.001) - 1.0
+    assert result.oos_metrics["buy_hold_return"] == pytest.approx(expected)
+    # par fenêtre aussi : fenêtre 2 = open[9] = 108 → close[11] = 111
+    assert result.windows[1]["oos_return"] < 111.0 / 108.0 - 1.0  # la stratégie paie ses frais
+
+
+# ============================================================================ F55 : kill switch après coup
+def test_chained_oos_equity_checked_against_max_drawdown() -> None:
+    """Escalier descendant 100, 99, 98… ; kill switch à 5 %. Chaque fenêtre perd ~3 % (jamais
+    5 % : le moteur ne le déclenche pas), mais la courbe OOS enchaînée perd 6,3 %."""
+    df = staircase(12, step=-1.0)
+    cfg = BacktestConfig(initial_cash=CASH, fee_rate=0.0, slippage=0.0)
+    risk = RiskManager(
+        RiskConfig(
+            risk_per_trade=1.0,
+            max_position_fraction=1.0,
+            max_drawdown=0.05,
+            daily_loss_limit=None,
+            min_trade_notional=0.0,
+            default_stop_pct=0.99,
+        )
+    )
+    result = walk_forward(df, AlwaysLong, train_bars=4, test_bars=4, config=cfg, risk=risk)
+    c = df["close"].to_numpy()
+    w1 = c[7] / c[4]  # 93 / 96 : -3,1 % dans la fenêtre 1
+    assert result.windows[0]["oos_return"] == pytest.approx(w1 - 1)
+    assert result.n_window_kill_switches == 0  # le moteur repart de zéro à chaque fenêtre
+    assert all(w["oos_kill_switch"] is False for w in result.windows)
+    assert result.oos_metrics["max_drawdown"] == pytest.approx(w1 * c[11] / c[8] - 1)  # -6,28 %
+    assert result.max_drawdown_limit == 0.05
+    # première bougie sous -5 % : équité w1 × close[t] / 92 < 0,95 ⇔ close[t] < 90,22 → t = 10
+    assert result.oos_kill_switch_time == df.index[10]
+    assert result.oos_kill_switch_drawdown == pytest.approx(1 - w1 * c[10] / c[8])
+    text = result.summary()
+    assert "⚠ En réel, le kill switch (drawdown max 5.00 %) aurait arrêté le robot le" in text
+    assert "2024-01-01 10:00" in text
+    assert f"baisse de {(1 - w1 * c[10] / c[8]) * 100:.2f} %" in text
+    assert "repartent de zéro à chaque fenêtre" in text
+    # escalier montant : pas de dépassement, message rassurant
+    up = walk_forward(staircase(12), AlwaysLong, train_bars=4, test_bars=4, config=cfg, risk=risk)
+    assert up.oos_kill_switch_time is None and up.oos_kill_switch_drawdown == 0.0
+    assert "ne l'aurait pas déclenché" in up.summary()
+    assert "⚠" not in up.summary()
+
+
+def test_chained_kill_switch_logged_and_window_kill_switch_counted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    df = staircase(12, step=-1.0)
+    cfg = BacktestConfig(initial_cash=CASH, fee_rate=0.0, slippage=0.0)
+    risk = RiskManager(
+        RiskConfig(
+            risk_per_trade=1.0,
+            max_position_fraction=1.0,
+            max_drawdown=0.02,
+            daily_loss_limit=None,
+            min_trade_notional=0.0,
+            default_stop_pct=0.99,
+        )
+    )
+    result = walk_forward(df, AlwaysLong, train_bars=4, test_bars=4, config=cfg, risk=risk)
+    # -2 % atteints dans chaque fenêtre : le kill switch du moteur ferme la position
+    assert result.n_window_kill_switches == 2
+    assert all(w["oos_kill_switch"] for w in result.windows)
+    assert result.oos_trades["exit_reason"].tolist() == ["kill_switch", "kill_switch"]
+    assert "Kill switch déclenché à l'intérieur de 2 fenêtre(s)" in result.summary()
+    assert result.oos_kill_switch_time is not None
+    msgs = [r.getMessage() for r in caplog.records if r.name == LOGGER]
+    assert any("kill switch aurait arrêté le robot" in m for m in msgs)
+
+
+def test_default_risk_config_used_when_risk_is_none() -> None:
+    df = staircase(12)
+    result = walk_forward(df, Recording, train_bars=4, test_bars=4)
+    assert result.max_drawdown_limit == pytest.approx(RiskConfig().max_drawdown)
+    assert result.daily_limit_active is True
+
+
+# ============================================================================ D5 : limite journalière
+def test_daily_limit_inactive_on_daily_bars_is_reported() -> None:
+    df = make_ohlcv(n=300, seed=5, freq="1D")
+    result = walk_forward(df, Recording, train_bars=100, test_bars=50)
+    assert result.daily_limit_active is False
+    assert "Limite de perte journalière inactive : bougies >= 1 jour" in result.summary()
+    hourly = walk_forward(make_ohlcv(n=300, seed=5), Recording, train_bars=100, test_bars=50)
+    assert hourly.daily_limit_active is True
+    assert "inactive" not in hourly.summary()
 
 
 # ============================================================================ stratégie réelle (optionnelle)

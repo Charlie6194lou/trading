@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time
 from abc import ABC, abstractmethod
@@ -27,7 +28,9 @@ from tradingbot.backtest.engine import (
     _realized_vol,
     run_backtest,
 )
+from tradingbot.data.synthetic import generate_ohlcv
 from tradingbot.risk import RiskConfig, RiskManager
+from tradingbot.strategies import get_strategy
 
 try:
     from tradingbot.strategies.base import Strategy
@@ -134,6 +137,15 @@ def no_guard_risk(**overrides: Any) -> RiskManager:
     return RiskManager(RiskConfig(**kwargs))
 
 
+def max_fraction_risk(**overrides: Any) -> RiskManager:
+    """Risque sans garde-fous dont le sizing sature toujours ``max_position_fraction`` :
+    une position ne s'ouvre jamais sans stop, alors on prend un stop de dernier recours
+    très loin (99 % du prix) et ``risk_per_trade = 1`` → taille = 95 % de l'équité."""
+    kwargs: dict[str, Any] = {"risk_per_trade": 1.0, "default_stop_pct": 0.99}
+    kwargs.update(overrides)
+    return no_guard_risk(**kwargs)
+
+
 def cfg(**overrides: Any) -> BacktestConfig:
     kwargs: dict[str, Any] = {"initial_cash": CASH, "fee_rate": FEE, "slippage": SLIP}
     kwargs.update(overrides)
@@ -155,11 +167,11 @@ def test_long_entry_and_exit_on_signal() -> None:
         closes=[100, 105, 115, 118, 116, 119],
     )
     strat = ListStrategy(signals=[0, 1, 1, 0, 0, 0])
-    res = run_backtest(df, strat, cfg(), no_guard_risk())
+    res = run_backtest(df, strat, cfg(), max_fraction_risk())
 
     # Entrée à open[2] = 110 (signal de la bougie 1), slippage 0,1 % : 110,11.
     entry = 110 * (1 + SLIP)
-    size = CASH * 0.95 / entry  # pas de stop → fraction max ; notionnel = 9 500 exactement
+    size = CASH * 0.95 / entry  # sizing saturé : fraction max ; notionnel = 9 500 exactement
     fee1 = size * entry * FEE  # = 9,5
     assert fee1 == pytest.approx(9.5)
     cash_after_entry = CASH - size * entry - fee1  # 490,5
@@ -274,10 +286,10 @@ def test_take_profit_hit_intrabar() -> None:
         closes=[100, 100, 102, 109, 107, 107],
     )
     strat = ListStrategy(signals=[0, 1, 1, 0, 0, 0], takes=[NAN, 110, NAN, NAN, NAN, NAN])
-    res = run_backtest(df, strat, cfg(), no_guard_risk())
+    res = run_backtest(df, strat, cfg(), max_fraction_risk())
 
     entry = 100 * (1 + SLIP)
-    size = CASH * 0.95 / entry  # pas de stop → fraction max
+    size = CASH * 0.95 / entry  # sizing saturé → fraction max
     fee1 = 9.5
     cash1 = CASH - 9500.0 - fee1  # 490,5
     exit_px = 110 * (1 - SLIP)  # 109,89 (open 104 < 110, high 112 >= 110)
@@ -356,7 +368,7 @@ def test_allow_short_false_ignores_minus_one(config_short: bool, risk_short: boo
 def test_short_trade_when_allowed() -> None:
     df = _short_df()
     strat = ListStrategy(signals=[0, -1, -1, 0, 0, 0])
-    res = run_backtest(df, strat, cfg(allow_short=True), no_guard_risk(allow_short=True))
+    res = run_backtest(df, strat, cfg(allow_short=True), max_fraction_risk(allow_short=True))
 
     entry = 100 * (1 - SLIP)  # vente : 99,9
     size = CASH * 0.95 / entry
@@ -407,7 +419,7 @@ def test_short_gap_above_stop_and_short_take_profit() -> None:
     )
     strat2 = ListStrategy(signals=[0, -1, -1, 0, 0, 0], takes=[NAN, 90, NAN, NAN, NAN, NAN])
     res2 = run_backtest(
-        df2, strat2, cfg(slippage=0.0, allow_short=True), no_guard_risk(allow_short=True)
+        df2, strat2, cfg(slippage=0.0, allow_short=True), max_fraction_risk(allow_short=True)
     )
     tr2 = res2.trades.iloc[0]
     assert tr2["exit_reason"] == "take_profit"
@@ -425,7 +437,7 @@ def test_reversal_long_to_short_is_two_trades_with_four_fee_legs() -> None:
         closes=[100, 100, 105, 108, 104, 104],
     )
     strat = ListStrategy(signals=[0, 1, -1, 0, 0, 0])
-    res = run_backtest(df, strat, cfg(allow_short=True), no_guard_risk(allow_short=True))
+    res = run_backtest(df, strat, cfg(allow_short=True), max_fraction_risk(allow_short=True))
 
     entry1 = 100 * (1 + SLIP)
     size1 = CASH * 0.95 / entry1
@@ -482,7 +494,7 @@ def test_end_close_at_last_close_with_fees_and_slippage() -> None:
         closes=[100, 100, 105, 110, 115, 120],
     )
     strat = ListStrategy(signals=[0, 1, 1, 1, 1, 1])
-    res = run_backtest(df, strat, cfg(), no_guard_risk())
+    res = run_backtest(df, strat, cfg(), max_fraction_risk())
 
     entry = 100 * (1 + SLIP)
     size = CASH * 0.95 / entry
@@ -513,11 +525,16 @@ def test_kill_switch_closes_at_next_open_and_blocks_reentry() -> None:
         closes=[100, 100, 100, 85, 86, 87, 88, 89],
     )
     strat = ListStrategy(signals=[0, 1, 1, 1, 1, 1, 1, 1])
-    risk = RiskManager(RiskConfig(max_drawdown=0.10, daily_loss_limit=None))
+    risk = RiskManager(
+        RiskConfig(
+            max_drawdown=0.10, daily_loss_limit=None, risk_per_trade=1.0, default_stop_pct=0.99
+        )
+    )
     res = run_backtest(df, strat, cfg(slippage=0.0), risk)
 
-    # Entrée à 100 : 95 unités, frais 9,5, cash 490,5. Bougie 3 : équité 490,5 + 95×85
-    # = 8 565,5 soit -14,3 % depuis le plus haut (10 000) > 10 % → kill switch.
+    # Entrée à 100 (stop de dernier recours à 1, sizing saturé) : 95 unités, frais 9,5,
+    # cash 490,5. Bougie 3 : équité 490,5 + 95×85 = 8 565,5 soit -14,3 % depuis le plus
+    # haut (10 000) > 10 % → kill switch.
     assert res.equity.iloc[2] == pytest.approx(9990.5)
     assert res.equity.iloc[3] == pytest.approx(8565.5)
     # Clôture à open[4] = 85 : 95×85 = 8 075, frais 8,075.
@@ -532,6 +549,18 @@ def test_kill_switch_closes_at_next_open_and_blocks_reentry() -> None:
     assert tr["exit_time"] == df.index[4]
     assert tr["pnl"] == pytest.approx(-1442.575)
     assert risk.kill_switch_active()
+    # Événement visible : déclenché à la clôture de la bougie 3, équité 8 565,5.
+    assert len(res.events) == 1
+    ev = res.events[0]
+    assert ev["type"] == "kill_switch"
+    assert ev["timestamp"] == df.index[3].isoformat()
+    assert ev["equity"] == pytest.approx(8565.5)
+    assert ev["drawdown"] == pytest.approx(1 - 8565.5 / 10_000)
+    assert "drawdown 14.3 %" in ev["detail"] and "10 %" in ev["detail"]
+    assert res.metrics["kill_switch_triggered"] == 1
+    assert res.metrics["n_daily_limit_hits"] == 0
+    assert "kill switch le 2024-01-01 03:00" in res.summary()
+    json.dumps(res.events)
 
 
 def test_daily_limit_closes_blocks_then_resets_next_utc_day() -> None:
@@ -545,11 +574,16 @@ def test_daily_limit_closes_blocks_then_resets_next_utc_day() -> None:
     )
     assert df.index[3].date() != df.index[4].date()
     strat = ListStrategy(signals=[1] * 10)
-    risk = RiskManager(RiskConfig(max_drawdown=None, daily_loss_limit=0.05))
-    res = run_backtest(df, strat, cfg(slippage=0.0), risk)
+    risk = RiskManager(
+        RiskConfig(
+            max_drawdown=None, daily_loss_limit=0.05, risk_per_trade=1.0, default_stop_pct=0.99
+        )
+    )
+    # Politique « immediate » : le signal persistant ré-ouvre dès que la limite est levée.
+    res = run_backtest(df, strat, cfg(slippage=0.0, reentry_after_stop="immediate"), risk)
 
-    # Entrée à open[1] = 100 : 95 unités, cash 490,5. Bougie 2 : équité 490,5 + 95×93
-    # = 9 325,5 → -6,7 % sur la journée > 5 % → clôture à open[3] = 93.
+    # Entrée à open[1] = 100 : 95 unités (sizing saturé), cash 490,5. Bougie 2 : équité
+    # 490,5 + 95×93 = 9 325,5 → -6,7 % sur la journée > 5 % → clôture à open[3] = 93.
     assert res.equity.iloc[2] == pytest.approx(9325.5)
     cash_after = 490.5 + 95 * 93 - 95 * 93 * FEE  # 9 316,665
     assert cash_after == pytest.approx(9316.665)
@@ -566,6 +600,83 @@ def test_daily_limit_closes_blocks_then_resets_next_utc_day() -> None:
     # Nouvelle équité de référence le jour 2 = dernière équité du jour 1.
     assert risk.day_start_equity == pytest.approx(cash_after)
     assert res.equity.iloc[4] == pytest.approx(cash_after)
+    # Événement : un seul jour touché, consigné à la clôture de la bougie 2.
+    assert res.daily_limit_active is True
+    assert [e["type"] for e in res.events] == ["daily_limit"]
+    ev = res.events[0]
+    assert ev["timestamp"] == df.index[2].isoformat()
+    assert ev["equity"] == pytest.approx(9325.5)
+    assert "perte journalière 6.7 %" in ev["detail"] and "5 %" in ev["detail"]
+    assert res.metrics["n_daily_limit_hits"] == 1
+    assert res.metrics["kill_switch_triggered"] == 0
+    assert "limite journalière atteinte 1 jour(s)" in res.summary()
+
+
+def test_daily_limit_exit_blocks_same_side_until_signal_leaves_with_wait_policy() -> None:
+    df = make_df(
+        opens=[100, 100, 100, 93, 94, 95, 96, 97, 98, 99],
+        highs=[101, 101, 101, 95, 96, 97, 98, 99, 100, 101],
+        lows=[99, 99, 92, 92, 93, 94, 95, 96, 97, 98],
+        closes=[100, 100, 93, 94, 95, 96, 97, 98, 99, 100],
+        start="2024-01-01 20:00",
+    )
+    strat = ListStrategy(signals=[1] * 10)
+    risk = RiskManager(
+        RiskConfig(
+            max_drawdown=None, daily_loss_limit=0.05, risk_per_trade=1.0, default_stop_pct=0.99
+        )
+    )
+    res = run_backtest(df, strat, cfg(slippage=0.0), risk)  # reentry_after_stop = "wait"
+    # Même sortie « daily_limit » à open[3] ; le signal brut reste à 1 jusqu'à la fin →
+    # le côté long reste bloqué : aucune ré-entrée le jour 2.
+    assert list(res.positions) == [0, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+    assert list(res.trades["exit_reason"]) == ["daily_limit"]
+    assert res.metrics["n_daily_limit_hits"] == 1
+
+
+def test_daily_limit_is_inactive_on_daily_or_slower_bars(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sur des bougies >= 1 jour, chaque bougie est un nouveau jour UTC : la limite
+    journalière n'a pas de sens et ne doit jamais se déclencher (M1)."""
+    caplog.set_level(logging.INFO, logger="tradingbot.backtest.engine")
+    df = make_df(
+        opens=[100, 100, 100, 93, 94, 95, 96, 97],
+        highs=[101, 101, 101, 95, 96, 97, 98, 99],
+        lows=[99, 99, 92, 92, 93, 94, 95, 96],
+        closes=[100, 100, 93, 94, 95, 96, 97, 98],
+        freq="1D",
+    )
+    strat = ListStrategy(signals=[1] * 8)
+    risk = RiskManager(
+        RiskConfig(
+            max_drawdown=None, daily_loss_limit=0.05, risk_per_trade=1.0, default_stop_pct=0.99
+        )
+    )
+    res = run_backtest(df, strat, cfg(slippage=0.0), risk)
+    # Bougie 2 : -6,7 % en une bougie, mais aucune sortie « daily_limit ».
+    assert res.daily_limit_active is False
+    assert not risk.daily_limit_active
+    assert list(res.positions) == [0, 1, 1, 1, 1, 1, 1, 1]
+    assert list(res.trades["exit_reason"]) == ["end"]
+    assert res.events == []
+    assert res.metrics["n_daily_limit_hits"] == 0
+    assert "limite journalière inactive (bougies >= 1 jour)" in res.summary()
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any(
+        m.startswith("limite de perte journalière désactivée : bougies >= 1 jour") for m in messages
+    )
+
+    # Le même gestionnaire réutilisé sur des bougies horaires retrouve la limite active.
+    hourly = make_df(
+        opens=[100, 100, 100, 93, 94, 95, 96, 97],
+        highs=[101, 101, 101, 95, 96, 97, 98, 99],
+        lows=[99, 99, 92, 92, 93, 94, 95, 96],
+        closes=[100, 100, 93, 94, 95, 96, 97, 98],
+    )
+    res_h = run_backtest(hourly, strat, cfg(slippage=0.0), risk)
+    assert res_h.daily_limit_active is True and risk.daily_limit_active
+    assert res_h.trades.iloc[0]["exit_reason"] == "daily_limit"
 
 
 def test_risk_manager_state_is_reset_at_start() -> None:
@@ -592,7 +703,10 @@ def test_default_risk_manager_when_none_given() -> None:
         closes=[100, 100, 101, 102, 103, 104],
     )
     res = run_backtest(df, ListStrategy(signals=[0, 1, 1, 1, 1, 1]), cfg(slippage=0.0))
-    assert res.trades.iloc[0]["size"] == pytest.approx(95.0)  # 0,95 × 10 000 / 100
+    # Pas de stop de stratégie, pas de stop_loss_pct, ATR(14) indisponible (6 bougies) →
+    # stop de dernier recours 5 % : 95 ; taille = 10 000 × 1 % / (100 - 95) = 20 unités,
+    # et non 95 unités (95 % du capital sans stop).
+    assert res.trades.iloc[0]["size"] == pytest.approx(20.0)
 
 
 # ============================================================================ stops moteur
@@ -605,7 +719,7 @@ def test_trailing_stop_ratchets_on_highs_of_previous_bars() -> None:
     )
     strat = ListStrategy(signals=[0, 1, 1, 1, 0, 0, 0])
     res = run_backtest(
-        df, strat, cfg(fee_rate=0.0, slippage=0.0, trailing_stop_pct=0.05), no_guard_risk()
+        df, strat, cfg(fee_rate=0.0, slippage=0.0, trailing_stop_pct=0.05), max_fraction_risk()
     )
     # Entrée 100, stop 95. Fin bougie 2 : plus haut 104 → stop 98,8. Fin bougie 3 : plus
     # haut 120 → stop 114. Bougie 4 : open 115 > 114, low 110 <= 114 → sortie à 114.
@@ -645,7 +759,7 @@ def test_strategy_take_profit_update_while_in_position() -> None:
         closes=[100, 100, 101, 102, 100, 100],
     )
     strat = ListStrategy(signals=[0, 1, 1, 1, 0, 0], takes=[NAN, NAN, 103, NAN, NAN, NAN])
-    res = run_backtest(df, strat, cfg(fee_rate=0.0, slippage=0.0), no_guard_risk())
+    res = run_backtest(df, strat, cfg(fee_rate=0.0, slippage=0.0), max_fraction_risk())
     tr = res.trades.iloc[0]
     assert tr["exit_reason"] == "take_profit"
     assert tr["exit_price"] == pytest.approx(103.0)
@@ -680,7 +794,7 @@ def test_default_take_profit_pct() -> None:
     )
     strat = ListStrategy(signals=[0, 1, 1, 0, 0, 0])
     res = run_backtest(
-        df, strat, cfg(fee_rate=0.0, slippage=0.0, take_profit_pct=0.10), no_guard_risk()
+        df, strat, cfg(fee_rate=0.0, slippage=0.0, take_profit_pct=0.10), max_fraction_risk()
     )
     tr = res.trades.iloc[0]
     assert tr["exit_reason"] == "take_profit"
@@ -688,10 +802,75 @@ def test_default_take_profit_pct() -> None:
     assert tr["pnl"] == pytest.approx(95 * 10.0)
 
 
-def test_reentry_after_stop_only_if_signal_still_asks() -> None:
+def test_wait_policy_no_reentry_while_signal_persists_after_stop() -> None:
+    """Politique « wait » (défaut) : après un stop, le côté reste bloqué tant que le signal
+    brut n'a pas quitté ce côté (F13 / F46 / M3)."""
     df = _stop_df()
     strat = ListStrategy(signals=[0, 1, 1, 1, 0, 0], stops=[NAN, 95, NAN, NAN, NAN, NAN])
     res = run_backtest(df, strat, cfg(slippage=0.0), no_guard_risk())
+    # Stop touché bougie 3 ; signal[3] = 1 → PAS de réentrée (côté long bloqué) ;
+    # signal[4] = 0 lève le blocage mais ne demande rien.
+    assert list(res.positions) == [0, 0, 1, 1, 0, 0]
+    assert list(res.trades["exit_reason"]) == ["stop_loss"]
+
+
+def test_wait_policy_reopens_after_signal_left_the_side() -> None:
+    df = make_df(
+        opens=[100, 100, 100, 99, 98, 97, 97, 97],
+        highs=[101, 101, 103, 101, 99, 98, 98, 98],
+        lows=[99, 99, 97, 94, 96, 95, 96, 96],
+        closes=[100, 100, 102, 96, 97, 96, 97, 97],
+    )
+    strat = ListStrategy(
+        signals=[0, 1, 1, 1, 1, 0, 1, 1], stops=[NAN, 95, NAN, NAN, NAN, NAN, NAN, NAN]
+    )
+    res = run_backtest(df, strat, cfg(fee_rate=0.0, slippage=0.0), no_guard_risk())
+    # Stop bougie 3 ; signaux 1 aux bougies 3 et 4 → bloqué ; 0 à la bougie 5 → levée ;
+    # 1 à la bougie 6 → nouvelle entrée à open[7] = 97, tenue jusqu'à la fin.
+    assert list(res.positions) == [0, 0, 1, 1, 0, 0, 0, 1]
+    assert list(res.trades["exit_reason"]) == ["stop_loss", "end"]
+    t1, t2 = res.trades.iloc[0], res.trades.iloc[1]
+    # Premier trade : 20 unités (100 / 5), stop à 95 → -100 exactement (sans frais).
+    assert t1["size"] == pytest.approx(20.0)
+    assert t1["pnl"] == pytest.approx(-100.0)
+    assert t2["entry_time"] == df.index[7]
+    assert t2["entry_price"] == pytest.approx(97.0)
+    # Deuxième entrée : pas de stop de stratégie, ATR indisponible → stop 5 % (92,15) ;
+    # taille = 9 900 × 1 % / (97 − 92,15) = 99 / 4,85.
+    assert res.equity.iloc[6] == pytest.approx(9900.0)
+    assert t2["size"] == pytest.approx(99.0 / 4.85)
+
+
+def test_wait_policy_flip_to_other_side_is_a_fresh_entry() -> None:
+    df = make_df(
+        opens=[100, 100, 100, 99, 98, 97],
+        highs=[101, 101, 103, 101, 99, 98],
+        lows=[99, 99, 97, 94, 96, 95],
+        closes=[100, 100, 102, 96, 97, 96],
+    )
+    strat = ListStrategy(signals=[0, 1, 1, -1, -1, -1], stops=[NAN, 95, NAN, NAN, NAN, NAN])
+    res = run_backtest(
+        df,
+        strat,
+        cfg(fee_rate=0.0, slippage=0.0, allow_short=True),
+        no_guard_risk(allow_short=True),
+    )
+    # Stop long bougie 3 ; le signal brut passe à -1 : le blocage du côté long ne concerne
+    # pas le short → ouverture courte à open[4] = 98.
+    assert list(res.positions) == [0, 0, 1, 1, -1, -1]
+    assert list(res.trades["exit_reason"]) == ["stop_loss", "end"]
+    assert res.trades.iloc[1]["side"] == -1
+    assert res.trades.iloc[1]["entry_price"] == pytest.approx(98.0)
+
+
+def test_immediate_policy_reenters_next_bar_with_a_stop() -> None:
+    """Ancien comportement sur demande (``reentry_after_stop="immediate"``), mais la
+    ré-entrée porte désormais un stop et une taille basée sur le risque."""
+    df = _stop_df()
+    strat = ListStrategy(signals=[0, 1, 1, 1, 0, 0], stops=[NAN, 95, NAN, NAN, NAN, NAN])
+    res = run_backtest(
+        df, strat, cfg(slippage=0.0, reentry_after_stop="immediate"), no_guard_risk()
+    )
     # Stop touché bougie 3 ; signal[3] = 1 → réentrée à open[4] ; signal[4] = 0 → sortie open[5].
     assert list(res.positions) == [0, 0, 1, 1, 1, 0]
     assert list(res.trades["exit_reason"]) == ["stop_loss", "signal"]
@@ -700,8 +879,168 @@ def test_reentry_after_stop_only_if_signal_still_asks() -> None:
     assert t2["entry_price"] == pytest.approx(98.0)
     assert t2["exit_time"] == df.index[5]
     assert t2["bars_held"] == 1
-    # Deuxième entrée sans stop : fraction max de l'équité de la clôture précédente.
-    assert t2["size"] == pytest.approx(res.equity.iloc[3] * 0.95 / 98.0)
+    # Deuxième entrée : stop de dernier recours 5 % → 93,1 ; taille = équité × 1 % / 4,9,
+    # loin des 95 % de l'équité d'autrefois.
+    assert t2["size"] == pytest.approx(res.equity.iloc[3] * 0.01 / (98.0 - 93.1))
+    assert t2["size"] * 98.0 < 0.25 * res.equity.iloc[3]
+
+
+def test_invalid_reentry_policy_raises() -> None:
+    df = make_df([100, 100], [101, 101], [99, 99], [100, 100])
+    with pytest.raises(ValueError, match="reentry_after_stop"):
+        run_backtest(df, ListStrategy(signals=[0, 0]), cfg(reentry_after_stop="toujours"))
+
+
+# ============================================================================ stop protecteur
+def _constant_range_df(n: int = 20) -> pd.DataFrame:
+    """open = close = 100, high 101, low 99 : true range 2 à chaque bougie → ATR(14) = 2
+    dès la bougie 14."""
+    return make_df(opens=[100.0] * n, highs=[101.0] * n, lows=[99.0] * n, closes=[100.0] * n)
+
+
+def test_entry_without_strategy_stop_gets_atr_default_stop_and_risk_based_size() -> None:
+    df = _constant_range_df(20)
+    strat = ListStrategy(signals=[0] * 15 + [1] * 5)
+    res = run_backtest(df, strat, cfg(fee_rate=0.0, slippage=0.0), no_guard_risk())
+    # Entrée à open[16] = 100 ; ATR(14) des bougies <= 15 vaut 2 → stop 100 − 3×2 = 94 ;
+    # taille = 10 000 × 1 % / 6.
+    tr = res.trades.iloc[0]
+    assert tr["entry_time"] == df.index[16]
+    assert tr["size"] == pytest.approx(100.0 / 6.0)
+    assert tr["exit_reason"] == "end"
+
+    # Le stop est bien actif : un plus bas à 93 (bougie 18) sort à 94, perte = 1 % du capital.
+    df2 = df.copy()
+    df2.loc[df2.index[18], ["low", "close"]] = [93.0, 95.0]
+    res2 = run_backtest(df2, strat, cfg(fee_rate=0.0, slippage=0.0), no_guard_risk())
+    tr2 = res2.trades.iloc[0]
+    assert tr2["exit_reason"] == "stop_loss"
+    assert tr2["exit_time"] == df2.index[18]
+    assert tr2["exit_price"] == pytest.approx(94.0)
+    assert tr2["pnl"] == pytest.approx(-100.0)
+
+
+def test_stop_loss_pct_has_priority_over_atr_default_stop() -> None:
+    df = _constant_range_df(20)
+    strat = ListStrategy(signals=[0] * 15 + [1] * 5)
+    res = run_backtest(
+        df, strat, cfg(fee_rate=0.0, slippage=0.0, stop_loss_pct=0.02), no_guard_risk()
+    )
+    # stop_loss_pct 2 % → stop 98 (et non 94 via l'ATR) → taille 100 / 2 = 50.
+    assert res.trades.iloc[0]["size"] == pytest.approx(50.0)
+
+
+def test_strategy_stop_on_wrong_side_is_replaced_and_ignored_while_in_position() -> None:
+    df = make_df(
+        opens=[100, 100, 100, 100, 100, 100],
+        highs=[101, 101, 101, 101, 101, 101],
+        lows=[99, 99, 99, 99, 99, 99],
+        closes=[100, 100, 100, 100, 100, 100],
+    )
+    # Stop « porté » par la stratégie à 105, au-dessus du prix d'entrée d'un long : ce
+    # n'est pas un stop. À l'entrée il est remplacé (ATR indisponible → 5 % = 95), et ses
+    # répétitions en position ne doivent pas forcer une sortie à l'ouverture suivante.
+    strat = ListStrategy(signals=[0, 1, 1, 1, 0, 0], stops=[NAN, 105, 105, 105, NAN, NAN])
+    res = run_backtest(df, strat, cfg(fee_rate=0.0, slippage=0.0), no_guard_risk())
+    # Entrée open[2], tenue bougies 2-4 (signal[4] = 0 → sortie à open[5]) : jamais stoppée.
+    assert list(res.positions) == [0, 0, 1, 1, 1, 0]
+    tr = res.trades.iloc[0]
+    assert tr["exit_reason"] == "signal"
+    assert tr["exit_time"] == df.index[5]
+    assert tr["size"] == pytest.approx(20.0)  # 100 / (100 − 95)
+
+
+def test_entries_are_never_naked_for_every_shipped_strategy() -> None:
+    """Toute entrée est dimensionnée à partir d'un stop : notionnel <= 95 % de l'équité
+    et, quand le plafond ne mord pas, perte au stop = risk_per_trade × équité (M2)."""
+    df = generate_ohlcv(n=3000, seed=42)
+    for name in ("sma_cross", "ema_trend", "rsi_reversion", "donchian_breakout", "bollinger"):
+        full = "bollinger_reversion" if name == "bollinger" else name
+        strat = get_strategy(full)
+        res = run_backtest(df, strat, cfg(slippage=0.0), no_guard_risk())
+        assert len(res.trades) > 0, full
+        loc = {ts: i for i, ts in enumerate(df.index)}
+        sl = res.signals["stop_loss"].to_numpy()
+        for _, tr in res.trades.iterrows():
+            t = loc[tr["entry_time"]]
+            eq_prev = res.equity.iloc[t - 1]
+            notional = tr["size"] * tr["entry_price"]
+            assert notional <= eq_prev * 0.95 * (1 + 1e-9), full
+            strat_stop = sl[t - 1]
+            assert np.isfinite(strat_stop), full  # le stop est porté sur toute la position
+            if notional < eq_prev * 0.95 * (1 - 1e-9):
+                assert tr["size"] * abs(tr["entry_price"] - strat_stop) == pytest.approx(
+                    0.01 * eq_prev, rel=1e-9
+                ), full
+
+
+def test_ema_trend_stop_outs_are_seen_by_the_strategy_no_same_side_reentry_next_bar() -> None:
+    """F14 / F48 : la stratégie sort quand le plus bas touche son chandelier, exactement
+    comme le moteur. Plus aucune ré-entrée du même côté dès la bougie suivant un stop, même
+    avec la politique « immediate » (le signal est à 0 sur la bougie du stop)."""
+    df = generate_ohlcv(n=3000, seed=42)
+    res = run_backtest(
+        df,
+        get_strategy("ema_trend"),
+        cfg(fee_rate=0.001, slippage=0.0005, reentry_after_stop="immediate"),
+        no_guard_risk(),
+    )
+    tr = res.trades.reset_index(drop=True)
+    loc = {ts: i for i, ts in enumerate(df.index)}
+    stops = tr[tr["exit_reason"] == "stop_loss"]
+    assert len(stops) > 5
+    sig = res.signals["signal"].to_numpy()
+    for _, row in stops.iterrows():
+        assert sig[loc[row["exit_time"]]] != row["side"]  # la stratégie a vu le stop
+    next_bar = sum(
+        1
+        for i in range(1, len(tr))
+        if tr.loc[i - 1, "exit_reason"] == "stop_loss"
+        and tr.loc[i, "side"] == tr.loc[i - 1, "side"]
+        and loc[tr.loc[i, "entry_time"]] == loc[tr.loc[i - 1, "exit_time"]] + 1
+    )
+    assert next_bar == 0  # avant : 32 ré-entrées immédiates sur 75 trades
+    assert len(tr) < 60
+
+
+# ============================================================================ gaps (F15)
+def test_gap_open_beyond_take_profit_wins_over_intrabar_stop() -> None:
+    df = make_df(
+        opens=[100, 100, 112, 100],
+        highs=[101, 101, 130, 101],
+        lows=[99, 99, 80, 99],
+        closes=[100, 100, 100, 100],
+    )
+    strat = ListStrategy(signals=[1, 1, 1, 0], stops=[90, 90, 90, NAN], takes=[110, 110, 110, NAN])
+    res = run_backtest(df, strat, cfg(fee_rate=0.0, slippage=0.0), no_guard_risk())
+    # Entrée open[1] = 100, stop 90, objectif 110 → 10 unités. Bougie 2 : ouverture 112 déjà
+    # au-delà de l'objectif → sortie à 112 (le gap lève l'ambiguïté), même si le plus bas
+    # (80) passe ensuite sous le stop.
+    tr = res.trades.iloc[0]
+    assert tr["size"] == pytest.approx(10.0)
+    assert tr["exit_reason"] == "take_profit"
+    assert tr["exit_price"] == pytest.approx(112.0)
+    assert tr["pnl"] == pytest.approx(120.0)
+
+    df_s = make_df(
+        opens=[100, 100, 88, 100],
+        highs=[101, 101, 120, 101],
+        lows=[99, 99, 60, 99],
+        closes=[100, 100, 100, 100],
+    )
+    strat_s = ListStrategy(
+        signals=[-1, -1, -1, 0], stops=[110, 110, 110, NAN], takes=[90, 90, 90, NAN]
+    )
+    res_s = run_backtest(
+        df_s,
+        strat_s,
+        cfg(fee_rate=0.0, slippage=0.0, allow_short=True),
+        no_guard_risk(allow_short=True),
+    )
+    tr_s = res_s.trades.iloc[0]
+    assert tr_s["exit_reason"] == "take_profit"
+    assert tr_s["exit_price"] == pytest.approx(88.0)
+    assert tr_s["pnl"] == pytest.approx(120.0)
 
 
 def test_min_notional_prevents_trade() -> None:
@@ -728,7 +1067,7 @@ def test_signal_at_t_executes_at_open_t_plus_1_against_manual_computation() -> N
         closes=[o + 2 for o in opens],
     )
     signals = [0, 0, 0, 1, 0, 0, 0, 0]
-    res = run_backtest(df, ListStrategy(signals=signals), cfg(), no_guard_risk())
+    res = run_backtest(df, ListStrategy(signals=signals), cfg(), max_fraction_risk())
 
     # Calcul manuel : signal[3] → achat à open[4] = 108 ; signal[4] = 0 → vente à open[5].
     entry = 108 * (1 + SLIP)
@@ -746,7 +1085,7 @@ def test_signal_at_t_executes_at_open_t_plus_1_against_manual_computation() -> N
     # Modifier les bougies futures (>= 5) ne change ni l'entrée ni l'équité avant.
     df2 = df.copy()
     df2.loc[df2.index[5:], ["open", "high", "low", "close"]] *= 0.5
-    res2 = run_backtest(df2, ListStrategy(signals=signals), cfg(), no_guard_risk())
+    res2 = run_backtest(df2, ListStrategy(signals=signals), cfg(), max_fraction_risk())
     assert_series(res2.equity.iloc[:5], manual_equity[:5])
     tr2 = res2.trades.iloc[0]
     assert tr2["entry_price"] == pytest.approx(entry)
@@ -783,8 +1122,37 @@ def test_result_series_share_df_index_and_shapes() -> None:
     assert all(isinstance(v, float | int) for v in res.metrics.values())
     json.dumps(res.metrics)
     assert res.metrics["n_trades"] == 2
-    assert res.metrics["buy_hold_return"] == pytest.approx(104 / 100 - 1)
+    # Buy & hold net : achat à open[0] = 100 (chauffe nulle) avec frais + slippage, revente
+    # à la dernière clôture 104 avec frais + slippage.
+    expected_bh = 104 * (1 - SLIP) * (1 - FEE) / (100 * (1 + SLIP) * (1 + FEE)) - 1
+    assert res.metrics["buy_hold_return"] == pytest.approx(expected_bh)
     assert res.metrics["exposure"] == pytest.approx(2 / 6)
+    assert res.metrics["kill_switch_triggered"] == 0
+    assert res.metrics["n_daily_limit_hits"] == 0
+    assert isinstance(res.metrics["kill_switch_triggered"], int)
+    assert res.events == []
+    assert res.warmup_bars == 0
+    assert res.daily_limit_active is True
+
+
+def test_buy_hold_benchmark_starts_where_the_strategy_can_trade() -> None:
+    """F54 : le buy & hold de référence part de open[warmup + 1] (première exécution
+    possible) et paie un aller-retour de frais + slippage, comme la stratégie."""
+    opens = [100, 102, 104, 106, 108, 110, 112, 114]
+    df = make_df(
+        opens=opens,
+        highs=[o + 3 for o in opens],
+        lows=[o - 1 for o in opens],
+        closes=[o + 2 for o in opens],
+    )
+    res = run_backtest(df, ListStrategy(signals=[1] * 8, warmup=3), cfg(), no_guard_risk())
+    assert res.warmup_bars == 3
+    expected = 116 * (1 - SLIP) * (1 - FEE) / (108 * (1 + SLIP) * (1 + FEE)) - 1
+    assert res.metrics["buy_hold_return"] == pytest.approx(expected)
+    # Une stratégie « toujours long » après la chauffe fait alors exactement le marché
+    # (à la taille près) : signe identique, pas de pénalité due à la chauffe.
+    assert res.trades.iloc[0]["entry_time"] == df.index[4]
+    assert res.metrics["buy_hold_return"] > 0
 
 
 def test_summary_is_french_text() -> None:

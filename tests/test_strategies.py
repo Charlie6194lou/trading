@@ -360,9 +360,41 @@ def test_entry_bars_carry_atr_stop(name: str) -> None:
         assert (stop[long_entry] < close[long_entry]).all(), dataset
         assert (stop[short_entry] > close[short_entry]).all(), dataset
         assert np.isnan(stop[sig == 0]).all(), dataset
+        # Le stop est porté sur CHAQUE bougie de la position (jamais NaN en position) ;
+        # pour les stratégies à stop fixe il reste égal au stop d'entrée.
+        assert np.isfinite(stop[sig != 0]).all(), dataset
         if name != "ema_trend":
-            assert np.isnan(stop[~entry]).all(), dataset
+            for start, end, _side in _runs(sig):
+                np.testing.assert_array_equal(stop[start:end], np.full(end - start, stop[start]))
     assert total_entries > 0
+
+
+@pytest.mark.parametrize("dataset", ["ohlcv", "daily", "trending", "falling"])
+def test_ema_trend_exits_exactly_when_its_exported_stop_is_touched(dataset: str) -> None:
+    """F14 / F48 : le stop exporté est exécuté par le moteur dès que ``low <= stop`` ; la
+    stratégie doit alors passer plate (ou se retourner), jamais rester du même côté avec
+    un stop déjà franchi."""
+    df = _datasets()[dataset]
+    out = get_strategy("ema_trend").generate_signals(df)
+    sig = out["signal"].to_numpy()
+    stop = out["stop_loss"].to_numpy()
+    low = df["low"].to_numpy()
+    high = df["high"].to_numpy()
+    prev = _prev(sig)
+    touched = 0
+    for t in range(1, len(sig)):
+        if prev[t] == 1 and low[t] <= stop[t - 1]:
+            touched += 1
+            assert sig[t] != 1, t
+        elif prev[t] == -1 and high[t] >= stop[t - 1]:
+            touched += 1
+            assert sig[t] != -1, t
+        elif prev[t] != 0 and sig[t] == prev[t]:
+            # Position conservée : le nouveau stop n'est jamais au-delà de la clôture.
+            assert (
+                (stop[t] < df["close"].iloc[t]) if sig[t] == 1 else (stop[t] > df["close"].iloc[t])
+            )
+    assert touched > 0
 
 
 @pytest.mark.parametrize("name", TREND_FOLLOWING)
@@ -433,7 +465,8 @@ def test_ema_trend_entries_exits_and_adx_rules(dataset: str) -> None:
     out = strat.generate_signals(df)
     sig = out["signal"].to_numpy()
     stop = out["stop_loss"].to_numpy()
-    close = df["close"].to_numpy()
+    low = df["low"].to_numpy()
+    high = df["high"].to_numpy()
     fast = ind.ema(df["close"], p["fast"]).to_numpy()
     slow = ind.ema(df["close"], p["slow"]).to_numpy()
     adx = ind.adx(df, p["adx_window"])["adx"].to_numpy()
@@ -449,8 +482,8 @@ def test_ema_trend_entries_exits_and_adx_rules(dataset: str) -> None:
     for t in range(w, len(sig)):
         if prev[t] != 0 and sig[t] != prev[t]:
             flipped = np.sign(fast[t] - slow[t]) == -prev[t]
-            breached = (prev[t] == 1 and close[t] < stop[t - 1]) or (
-                prev[t] == -1 and close[t] > stop[t - 1]
+            breached = (prev[t] == 1 and low[t] <= stop[t - 1]) or (
+                prev[t] == -1 and high[t] >= stop[t - 1]
             )
             assert flipped or breached, t
             if breached and not flipped:
@@ -459,8 +492,8 @@ def test_ema_trend_entries_exits_and_adx_rules(dataset: str) -> None:
             prev[t] != 0
             and np.sign(fast[t] - slow[t]) == prev[t]
             and not (
-                (prev[t] == 1 and close[t] < stop[t - 1])
-                or (prev[t] == -1 and close[t] > stop[t - 1])
+                (prev[t] == 1 and low[t] <= stop[t - 1])
+                or (prev[t] == -1 and high[t] >= stop[t - 1])
             )
         ):
             assert sig[t] == prev[t], t  # la position est conservée...
@@ -564,7 +597,11 @@ def test_sma_cross_holds_position_on_exact_equality() -> None:
     assert sma2.iloc[11] == sma3.iloc[11]
     out = strat.generate_signals(df)
     assert out["signal"].tolist() == [0] * 8 + [1, 1, 1, 1, -1]
-    assert out["stop_loss"].notna().tolist() == [False] * 8 + [True, False, False, False, True]
+    stop = out["stop_loss"].to_numpy()
+    assert np.isnan(stop[:8]).all()
+    # Stop d'entrée porté pendant toute la position longue, nouveau stop au retournement.
+    assert (stop[8:12] == stop[8]).all() and stop[8] < 102
+    assert stop[12] != stop[8] and stop[12] > 100
 
 
 @pytest.mark.parametrize("dataset", ["ohlcv", "daily"])
@@ -678,7 +715,8 @@ def test_sma_cross_hand_computed() -> None:
     out = strat.generate_signals(df)
     assert out["signal"].tolist() == [0] * 8 + [1, 1, 1, 1, -1, -1, -1, 1]
     nan = math.nan
-    expected = [nan] * 8 + [99.5, nan, nan, nan, 105.71875, nan, nan, 99.78515625]
+    # Chaque stop d'entrée est porté (constant) jusqu'au changement de position.
+    expected = [nan] * 8 + [99.5] * 4 + [105.71875] * 3 + [99.78515625]
     np.testing.assert_array_equal(out["stop_loss"].to_numpy(), expected)
 
 
@@ -704,7 +742,7 @@ def test_donchian_hand_computed() -> None:
     out = strat.generate_signals(df)
     assert out["signal"].tolist() == [0] * 9 + [1, 1, 1, -1, -1, 1, 1]
     nan = math.nan
-    expected = [nan] * 9 + [100.0, nan, nan, 102.875, nan, 99.78125, nan]
+    expected = [nan] * 9 + [100.0] * 3 + [102.875] * 2 + [99.78125] * 2
     np.testing.assert_array_equal(out["stop_loss"].to_numpy(), expected)
 
 
@@ -733,7 +771,7 @@ def test_bollinger_hand_computed() -> None:
     assert out["signal"].tolist() == [0] * 9 + [1, 1, 1, 0, 0]
     nan = math.nan
     np.testing.assert_array_equal(
-        out["stop_loss"].to_numpy(), [nan] * 9 + [94.0, nan, nan, nan, nan]
+        out["stop_loss"].to_numpy(), [nan] * 9 + [94.0, 94.0, 94.0, nan, nan]
     )
 
 
@@ -769,7 +807,8 @@ def test_rsi_reversion_hand_computed_max_hold_exit() -> None:
     assert out["signal"].tolist() == [0] * 20 + [1, 1, 0, 0, 0]
     nan = math.nan
     np.testing.assert_array_equal(
-        out["stop_loss"].to_numpy(), [nan] * 20 + [105 - 2.296875, nan, nan, nan, nan]
+        out["stop_loss"].to_numpy(),
+        [nan] * 20 + [105 - 2.296875, 105 - 2.296875, nan, nan, nan],
     )
 
 
@@ -788,8 +827,9 @@ def test_rsi_reversion_hand_computed_rsi_exit() -> None:
     out = strat.generate_signals(df)
     # Même entrée t=20 ; RSI 13.7, 40, 24.85 ≤ 55 → on garde ; t=24 : RSI 81.35 > 55 → sortie.
     assert out["signal"].tolist() == [0] * 20 + [1, 1, 1, 1, 0]
-    assert out["stop_loss"].iloc[20] == 105 - 2.296875
-    assert out["stop_loss"].drop(out.index[20]).isna().all()
+    # Stop d'entrée porté sur les quatre bougies de la position (t=20..23), NaN ailleurs.
+    assert (out["stop_loss"].iloc[20:24] == 105 - 2.296875).all()
+    assert out["stop_loss"].drop(out.index[20:24]).isna().all()
 
 
 def _ema_trend_reference(df: pd.DataFrame, p: dict[str, Any], warmup: int) -> pd.DataFrame:
@@ -799,6 +839,8 @@ def _ema_trend_reference(df: pd.DataFrame, p: dict[str, Any], warmup: int) -> pd
     adx = ind.adx(df, p["adx_window"])["adx"].tolist()
     atr = ind.atr(df, p["atr_window"]).tolist()
     close = df["close"].astype(float).tolist()
+    low = df["low"].astype(float).tolist()
+    high = df["high"].astype(float).tolist()
     n = len(df)
     signal = [0] * n
     stop = [math.nan] * n
@@ -809,11 +851,12 @@ def _ema_trend_reference(df: pd.DataFrame, p: dict[str, Any], warmup: int) -> pd
             pos = 0
             continue
         trend = 0 if fast[t] == slow[t] else (1 if fast[t] > slow[t] else -1)
-        if pos == 1 and trend != -1 and close[t] >= trail:
+        # Sortie sur stop quand le plus bas (plus haut pour un short) touche le chandelier.
+        if pos == 1 and trend != -1 and low[t] > trail:
             trail = max(trail, close[t] - p["atr_mult"] * atr[t])
             signal[t], stop[t] = 1, trail
             continue
-        if pos == -1 and trend != 1 and close[t] <= trail:
+        if pos == -1 and trend != 1 and high[t] < trail:
             trail = min(trail, close[t] + p["atr_mult"] * atr[t])
             signal[t], stop[t] = -1, trail
             continue

@@ -17,8 +17,9 @@ Règles (position souhaitée pour la bougie suivante) :
 
 Les canaux sont calculés sur les bougies **précédentes** (``shift(1)`` dans
 ``tradingbot.indicators.donchian``) : la bougie courante ne peut pas déclencher sa propre
-cassure. Stop : sur la bougie d'entrée uniquement, ``stop_loss = close - atr_mult * ATR``
-(``close + …`` pour un short) ; ``NaN`` ailleurs. Aucun look-ahead.
+cassure. Stop : sur la bougie d'entrée, ``stop_loss = close - atr_mult * ATR`` (``close + …``
+pour un short) ; ce stop d'entrée est ensuite porté tel quel sur chaque bougie tant que
+la position est tenue (``NaN`` quand le signal est 0). Aucun look-ahead.
 """
 
 from __future__ import annotations
@@ -126,10 +127,12 @@ class DonchianBreakout(Strategy):
         stop = np.full(n, np.nan)
 
         pos = 0
+        cur_stop = np.nan  # stop d'entrée porté pendant toute la position
         n_entries = 0
         for t in range(n):
             if not valid[t]:
                 pos = 0
+                cur_stop = np.nan
                 continue
             c = close[t]
             if pos == 1 and c < lo_out[t]:
@@ -137,15 +140,18 @@ class DonchianBreakout(Strategy):
             elif pos == -1 and c > up_out[t]:
                 pos = 0
             if pos == 0:
+                cur_stop = np.nan
                 if c > up_in[t]:
                     pos = 1
-                    stop[t] = c - mult * atr[t]
+                    cur_stop = c - mult * atr[t]
                     n_entries += 1
                 elif c < lo_in[t]:
                     pos = -1
-                    stop[t] = c + mult * atr[t]
+                    cur_stop = c + mult * atr[t]
                     n_entries += 1
             signal[t] = pos
+            if pos != 0:
+                stop[t] = cur_stop
 
         logger.debug(
             "donchian_breakout(%d/%d) : %d bougies, %d entrées",

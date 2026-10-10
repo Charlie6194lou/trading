@@ -1,10 +1,10 @@
 """Rapports de backtest en français : texte aligné, comparaison, fichiers et graphique.
 
 - :func:`format_report` : rapport complet d'un :class:`~tradingbot.backtest.engine.BacktestResult`
-  (en-tête, métriques, comparaison avec le buy & hold, pires/meilleurs trades, paragraphe
-  de lecture pour débutant) ;
+  (en-tête, métriques, comparaison avec le buy & hold sur la même période tradable,
+  garde-fous déclenchés, pires/meilleurs trades, paragraphe de lecture pour débutant) ;
 - :func:`format_comparison` : tableau une ligne par stratégie, trié par Sharpe, plus la
-  ligne buy & hold ;
+  ligne buy & hold ; les stratégies arrêtées par un garde-fou sont marquées ``⚠ arrêt`` ;
 - :func:`save_report` : écrit ``equity.csv``, ``trades.csv``, ``summary.txt``,
   ``metrics.json`` (et ``equity.png`` si matplotlib est installé) ;
 - :func:`plot_result` : courbe d'équité + drawdown + marqueurs de trades ; matplotlib est
@@ -55,6 +55,14 @@ EXIT_REASON_LABELS: dict[str, str] = {
     "daily_limit": "limite journ.",
 }
 
+#: marqueurs ajoutés au nom d'une stratégie dans :func:`format_comparison`
+KILL_SWITCH_MARK = "⚠ arrêt"
+DAILY_LIMIT_MARK = "⚠ limite journ."
+REENTRY_LABELS: dict[str, str] = {
+    "wait": "attente d'un nouveau signal après un stop / objectif / limite journalière (wait)",
+    "immediate": "immédiate si le signal persiste (immediate)",
+}
+
 # Couleurs (palette de référence, voir skill dataviz) : série 1 bleu, statut vert / rouge.
 _COLOR_EQUITY = "#2a78d6"
 _COLOR_GOOD = "#008300"
@@ -95,6 +103,22 @@ def _fmt_money(x: Any) -> str:
     if not math.isfinite(x):
         return "n/d"
     return f"{x:,.2f}".replace(",", " ")
+
+
+def _fmt_price(x: Any) -> str:
+    """Prix lisible quelle que soit l'échelle : 4 décimales à partir de 1, sinon 6 chiffres
+    significatifs (notation scientifique sous 1e-4, ex. ``1.2e-05`` pour un « shitcoin »)."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "n/d"
+    if math.isnan(x):
+        return "n/d"
+    if math.isinf(x):
+        return "∞" if x > 0 else "-∞"
+    if abs(x) >= 1.0:
+        return f"{x:.4f}"
+    return f"{x:.6g}"
 
 
 def _fmt_ts(ts: Any) -> str:
@@ -179,8 +203,8 @@ def _trade_rows(trades: pd.DataFrame) -> list[list[str]]:
                 _fmt_ts(t.get("entry_time")),
                 _fmt_ts(t.get("exit_time")),
                 _side_label(t.get("side", 1)),
-                _fmt_num(t.get("entry_price"), 4),
-                _fmt_num(t.get("exit_price"), 4),
+                _fmt_price(t.get("entry_price")),
+                _fmt_price(t.get("exit_price")),
                 _fmt_money(t.get("pnl")),
                 _fmt_pct(t.get("pnl_pct")),
                 str(int(t.get("bars_held", 0))) if not pd.isna(t.get("bars_held", 0)) else "n/d",
@@ -218,6 +242,59 @@ def _benchmark_return(result: BacktestResult, benchmark_return: float | None) ->
         return None
     value = float(value)
     return None if math.isnan(value) else value
+
+
+def _events(result: BacktestResult) -> list[dict[str, Any]]:
+    events = getattr(result, "events", None) or []
+    return [e for e in events if isinstance(e, dict)]
+
+
+def _guard_rail_lines(result: BacktestResult) -> list[str]:
+    """Section « Garde-fous » : événements du kill switch / de la limite journalière et
+    état de la limite journalière, en langage simple."""
+    lines: list[str] = []
+    events = _events(result)
+    for e in events:
+        kind = str(e.get("type", ""))
+        when = _fmt_ts(e.get("timestamp"))
+        equity = _fmt_money(e.get("equity"))
+        try:
+            dd = float(e.get("drawdown", 0.0))
+        except (TypeError, ValueError):
+            dd = 0.0
+        if kind == "kill_switch":
+            lines.append(
+                _wrap(
+                    f"Kill switch le {when} (capital {equity}) : le robot a cessé de trader le "
+                    f"{when} après une baisse de {_fmt_pct(dd, signed=False)} depuis le sommet, "
+                    "et n'a plus rien ouvert jusqu'à la fin du backtest. Le rendement affiché "
+                    "s'arrête donc là : le reste de la période n'a pas été tradé."
+                )
+            )
+        elif kind == "daily_limit":
+            lines.append(
+                _wrap(
+                    f"Limite journalière le {when} (capital {equity}) : le robot a fermé sa "
+                    "position et a cessé de trader jusqu'au jour UTC suivant."
+                )
+            )
+        else:  # type inconnu : on affiche au moins le détail fourni
+            lines.append(_wrap(f"{kind or 'événement'} le {when} : {e.get('detail', '')}"))
+    n_daily = sum(1 for e in events if e.get("type") == "daily_limit")
+    if n_daily > 1:
+        lines.append(_wrap(f"La limite journalière a été atteinte {n_daily} jours au total."))
+    if not getattr(result, "daily_limit_active", True):
+        lines.append(
+            _wrap(
+                "Limite de perte journalière : inactive sur ce backtest (bougies >= 1 jour). "
+                "Elle compare le capital à celui du début de la journée : sur des bougies "
+                "journalières ou plus longues, chaque bougie est un nouveau jour et elle n'a "
+                "pas de sens ; le kill switch reste actif."
+            )
+        )
+    if not lines:
+        lines.append("Aucun garde-fou déclenché (kill switch, limite de perte journalière).")
+    return lines
 
 
 def _total_fees(trades: pd.DataFrame) -> float:
@@ -362,6 +439,15 @@ def format_report(result: BacktestResult, benchmark_return: float | None = None)
         stops.append(f"stop suiveur {_fmt_pct(cfg.trailing_stop_pct, signed=False)}")
     if stops:
         header_rows.append(("Stops par défaut", ", ".join(stops)))
+    header_rows.append(
+        (
+            "Stop de protection",
+            "toujours présent (stratégie, sinon stop par défaut, sinon ATR, sinon %) ; "
+            "taille = risque par trade",
+        )
+    )
+    reentry = str(getattr(cfg, "reentry_after_stop", "wait"))
+    header_rows.append(("Ré-entrée après stop", REENTRY_LABELS.get(reentry, reentry)))
     header_rows.append(("Vente à découvert", "autorisée" if cfg.allow_short else "désactivée"))
     lines.extend(_aligned(header_rows))
 
@@ -420,6 +506,20 @@ def format_report(result: BacktestResult, benchmark_return: float | None = None)
             )
         )
         lines.append(verdict)
+        if benchmark_return is None:
+            warmup = int(getattr(result, "warmup_bars", 0) or 0)
+            lines.append(
+                _wrap(
+                    "Buy & hold sur la même période tradable, frais inclus : achat à la "
+                    f"première bougie où la stratégie pouvait trader (après {warmup} bougies de "
+                    "chauffe), revente à la dernière clôture, avec les mêmes frais et le même "
+                    "glissement qu'un trade.",
+                    bullet="",
+                )
+            )
+
+    lines.extend(["", "Garde-fous déclenchés", "---------------------"])
+    lines.extend(_guard_rail_lines(result))
 
     n_trades = len(trades)
     if n_trades == 0:
@@ -450,6 +550,7 @@ def _comparison_rows(results: list[BacktestResult]) -> list[tuple[float, list[st
         label = str(r.strategy_name)
         if duplicated and r.params:
             label = f"{label} ({_fmt_params(r.params)})"
+        label += _guard_mark(r)
         sharpe = float(m.get("sharpe", math.nan))
         rows.append(
             (
@@ -470,51 +571,100 @@ def _comparison_rows(results: list[BacktestResult]) -> list[tuple[float, list[st
     return rows
 
 
+def _guard_mark(result: BacktestResult) -> str:
+    """Suffixe ``⚠`` du nom d'une stratégie arrêtée par un garde-fou (vide sinon)."""
+    kinds = [str(e.get("type")) for e in _events(result)]
+    marks: list[str] = []
+    if "kill_switch" in kinds:
+        marks.append(KILL_SWITCH_MARK)
+    n_daily = kinds.count("daily_limit")
+    if n_daily:
+        marks.append(f"{DAILY_LIMIT_MARK} ×{n_daily}")
+    return (" " + " ".join(marks)) if marks else ""
+
+
+def _common_first_tradable(results: list[BacktestResult]) -> tuple[int, int]:
+    """(indice de la première bougie tradable par TOUTES les stratégies, chauffe max).
+
+    Même convention que le moteur : ``warmup + 1`` (``0`` si la chauffe est nulle), borné
+    à la dernière bougie.
+    """
+    warmup = max(int(getattr(r, "warmup_bars", 0) or 0) for r in results)
+    n_bars = max(len(r.equity) for r in results)
+    first = min(warmup + 1, max(n_bars - 1, 0)) if warmup > 0 else 0
+    return first, warmup
+
+
+def _reference_result(results: list[BacktestResult]) -> BacktestResult:
+    """Résultat dont le ``buy_hold_return`` couvre la période tradable commune (chauffe la
+    plus longue)."""
+    return max(results, key=lambda r: int(getattr(r, "warmup_bars", 0) or 0))
+
+
 def _buy_hold_row(results: list[BacktestResult], benchmark: pd.Series | None) -> list[str]:
-    ref = results[0]
-    n_bars = len(ref.equity)
-    ppy = float(getattr(ref, "periods_per_year", 365.0))
+    """Ligne « Buy & hold » : achat-conservation sur la période tradable commune (après la
+    plus longue chauffe), net d'un aller-retour de frais + glissement (règle 8 du moteur).
+
+    Avec ``benchmark`` (clôtures de la période), la ligne a aussi un CAGR calculé sur le
+    temps écoulé, un Sharpe et un drawdown ; sinon seul le rendement net du moteur
+    (``metrics["buy_hold_return"]`` de la stratégie à la plus longue chauffe) et le CAGR
+    correspondant sont affichés.
+    """
+    ref = _reference_result(results)
+    cfg = ref.config
+    fee = float(getattr(cfg, "fee_rate", 0.0) or 0.0)
+    slip = float(getattr(cfg, "slippage", 0.0) or 0.0)
+    first, _warmup = _common_first_tradable(results)
     if benchmark is not None and len(benchmark) >= 2:
-        prices = np.asarray(benchmark, dtype=np.float64).ravel()
-        prices = prices[np.isfinite(prices)]
-        if prices.size >= 2 and prices[0] > 0:
-            bh_equity = pd.Series(float(ref.config.initial_cash) * prices / prices[0])
-            try:
-                bm = metrics_mod.compute_metrics(bh_equity, None, ppy)
-            except OverflowError:  # CAGR astronomique sur très peu de bougies
-                logger.debug("Métriques buy & hold non calculables (dépassement numérique)")
-            else:
-                return [
-                    "Buy & hold",
-                    _fmt_pct(bm["total_return"]),
-                    _fmt_pct(bm["cagr"]),
-                    _fmt_num(bm["sharpe"]),
-                    _fmt_pct(bm["max_drawdown"]),
-                    "1",
-                    "–",
-                ]
+        bench = pd.Series(np.asarray(benchmark, dtype=np.float64).ravel())
+        if isinstance(benchmark, pd.Series) and len(benchmark.index) == len(bench):
+            bench.index = benchmark.index
+        bench = bench.iloc[min(first, len(bench) - 1) :]
+        bench = bench[np.isfinite(bench.to_numpy())]
+        if len(bench) >= 2 and float(bench.iloc[0]) > 0:
+            prices = bench.to_numpy()
+            # Achat à la première clôture tradable (≈ ouverture suivante), frais inclus.
+            cost = float(prices[0]) * (1.0 + slip) * (1.0 + fee)
+            bh_equity = pd.Series(float(cfg.initial_cash) * prices / cost, index=bench.index)
+            bh_equity.iloc[-1] = float(bh_equity.iloc[-1]) * (1.0 - slip) * (1.0 - fee)
+            bh_equity.iloc[0] = float(cfg.initial_cash)
+            bm = metrics_mod.compute_metrics(bh_equity, None, float(ref.periods_per_year))
+            return [
+                "Buy & hold",
+                _fmt_pct(bm["total_return"]),
+                _fmt_pct(bm["cagr"]),
+                _fmt_num(bm["sharpe"]),
+                _fmt_pct(bm["max_drawdown"]),
+                "1",
+                "–",
+            ]
     bh = ref.metrics.get("buy_hold_return")
     if bh is None:
         return ["Buy & hold", "n/d", "n/d", "–", "–", "1", "–"]
     bh = float(bh)
-    if n_bars > 1 and bh > -1.0 and ppy > 0:
-        try:
-            bh_cagr = (1.0 + bh) ** (ppy / (n_bars - 1)) - 1.0
-        except OverflowError:
-            bh_cagr = math.inf
-    else:
-        bh_cagr = -1.0 if bh <= -1.0 else 0.0
+    eq = ref.equity
+    years = metrics_mod.years_elapsed(
+        eq.iloc[min(first, max(len(eq) - 1, 0)) :], float(ref.periods_per_year)
+    )
+    bh_cagr = metrics_mod.annualize_return(bh, years) if years > 0 else 0.0
     return ["Buy & hold", _fmt_pct(bh), _fmt_pct(bh_cagr), "–", "–", "1", "–"]
 
 
 def format_comparison(results: list[BacktestResult], benchmark: pd.Series | None = None) -> str:
     """Tableau comparatif : une ligne par stratégie (triées par Sharpe décroissant) plus
-    la ligne « Buy & hold ».
+    la ligne « Buy & hold », suivie de notes.
 
     :param results: résultats à comparer (idéalement sur les mêmes bougies).
     :param benchmark: série de prix (``close``) de la période ; si fournie, la ligne buy &
-        hold a aussi un Sharpe et un drawdown ; sinon seul le rendement (tiré de
-        ``metrics["buy_hold_return"]``) et le CAGR correspondant sont affichés.
+        hold a aussi un Sharpe et un drawdown ; sinon seul le rendement net du moteur
+        (``metrics["buy_hold_return"]``) et le CAGR correspondant sont affichés. Dans les
+        deux cas le buy & hold porte sur la période tradable commune (après la plus longue
+        chauffe) et inclut un aller-retour de frais + glissement.
+
+    Une stratégie dont le kill switch s'est déclenché est marquée ``⚠ arrêt`` (elle a cessé
+    de trader avant la fin : son rendement n'est pas comparable) ; ``⚠ limite journ. ×N``
+    compte les jours bloqués par la limite de perte journalière. Une note signale quand la
+    limite journalière était inactive (bougies >= 1 jour).
     """
     results = list(results)
     if not results:
@@ -530,7 +680,51 @@ def format_comparison(results: list[BacktestResult], benchmark: pd.Series | None
             widths[i] = max(widths[i], len(cell))
     table.insert(len(table) - 1, "-+-".join("-" * w for w in widths))
     title = "Comparaison des stratégies (triées par Sharpe décroissant)"
-    return "\n".join([title, "=" * len(title), *table])
+    notes = _comparison_notes(results)
+    return "\n".join([title, "=" * len(title), *table, *notes])
+
+
+def _comparison_notes(results: list[BacktestResult]) -> list[str]:
+    """Notes sous le tableau : période du buy & hold, marqueurs ⚠, limite journalière."""
+    _first, warmup = _common_first_tradable(results)
+    notes = [
+        "",
+        _wrap(
+            "Buy & hold : achat-conservation sur la période tradable commune (après la plus "
+            f"longue chauffe : {warmup} bougies), frais et glissement inclus, comme un trade.",
+            bullet="",
+        ),
+    ]
+    kills = [r for r in results if any(e.get("type") == "kill_switch" for e in _events(r))]
+    if kills:
+        names = ", ".join(str(r.strategy_name) for r in kills)
+        notes.append(
+            _wrap(
+                f"{KILL_SWITCH_MARK} : kill switch déclenché ({names}) : le robot a cessé de "
+                "trader avant la fin de la période après une baisse supérieure au drawdown "
+                "maximal autorisé ; le rendement affiché n'est pas comparable aux autres (voir "
+                "le rapport détaillé : tradingbot backtest).",
+                bullet="",
+            )
+        )
+    n_daily = sum(1 for r in results for e in _events(r) if e.get("type") == "daily_limit")
+    if n_daily:
+        notes.append(
+            _wrap(
+                f"{DAILY_LIMIT_MARK} ×N : nombre de jours où la limite de perte journalière a "
+                "fermé la position et bloqué le robot jusqu'au lendemain.",
+                bullet="",
+            )
+        )
+    if any(not getattr(r, "daily_limit_active", True) for r in results):
+        notes.append(
+            _wrap(
+                "Limite de perte journalière inactive : bougies >= 1 jour (elle n'a de sens "
+                "qu'en intrajournalier) ; le kill switch reste actif.",
+                bullet="",
+            )
+        )
+    return notes
 
 
 def _json_safe(obj: Any) -> Any:

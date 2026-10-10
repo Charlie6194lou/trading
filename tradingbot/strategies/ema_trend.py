@@ -14,9 +14,12 @@ Règles (position souhaitée pour la bougie suivante) :
 - **Sortie** dès que l'une de ces conditions est vraie :
   1. les EMA se recroisent (``ema_fast < ema_slow`` pour un long) : on sort, et si l'ADX
      est au-dessus du seuil on se retourne directement (``-1``) sur la même bougie ;
-  2. la clôture passe sous le stop suiveur (au-dessus pour un short) : on passe à ``0``
-     pour la bougie suivante ; une nouvelle entrée n'est réévaluée qu'à la bougie d'après
-     (avec un nouveau stop).
+  2. le **plus bas** de la bougie touche le stop suiveur (``low <= stop`` ; ``high >=
+     stop`` pour un short) : c'est exactement la condition à laquelle le moteur de
+     backtest et le bot live exécutent le stop exporté dans ``stop_loss``. On passe à
+     ``0`` pour la bougie suivante ; une nouvelle entrée n'est réévaluée qu'à la bougie
+     d'après (avec un nouveau stop). La stratégie et le moteur voient donc la même sortie :
+     plus de ré-entrée immédiate avec un stop déjà touché.
 - **L'ADX ne sert qu'à l'entrée** : une position ouverte est conservée tant que les EMA
   restent dans le bon ordre, même si l'ADX redescend sous le seuil (une tendance qui
   ralentit n'est pas une tendance qui s'inverse).
@@ -141,6 +144,8 @@ class EmaTrend(Strategy):
         adx = adx_s.to_numpy().tolist()
         atr = atr_s.to_numpy().tolist()
         close = close_s.to_numpy().tolist()
+        low = df["low"].astype("float64").to_numpy().tolist()
+        high = df["high"].astype("float64").to_numpy().tolist()
 
         signal = np.zeros(n, dtype=np.int64)
         stop = np.full(n, np.nan)
@@ -161,8 +166,9 @@ class EmaTrend(Strategy):
                     # Les EMA se sont recroisées : sortie (retournement évalué ci-dessous).
                     pos = 0
                     trail = math.nan
-                elif (pos == 1 and c < trail) or (pos == -1 and c > trail):
-                    # Clôture au-delà du stop chandelier : plat pour la bougie suivante.
+                elif (pos == 1 and low[t] <= trail) or (pos == -1 and high[t] >= trail):
+                    # Le stop chandelier a été touché intrabar (même condition que le
+                    # moteur) : plat pour la bougie suivante, nouveau stop à la ré-entrée.
                     pos = 0
                     trail = math.nan
                     continue

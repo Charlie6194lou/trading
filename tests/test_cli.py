@@ -303,7 +303,7 @@ def test_backtest_csv_prints_report(csv_path: Path, capsys: pytest.CaptureFixtur
     assert "Rapport de backtest : sma_cross" in out
     assert "Sharpe" in out and "Drawdown maximal" in out
     assert "Lecture (pour débutant)" in out
-    assert "Capital initial   : 1 000.00" in out  # défaut de config.example.toml
+    assert "Capital initial      : 1 000.00" in out  # défaut de config.example.toml
 
 
 def test_backtest_report_dir_writes_files(
@@ -418,7 +418,7 @@ def test_backtest_cost_overrides(csv_path: Path, capsys: pytest.CaptureFixture[s
         ],
     )
     assert code == 0
-    assert "Capital initial   : 5 000.00" in out
+    assert "Capital initial      : 5 000.00" in out
     assert "frais 0.00 %, glissement 0.20 %" in out
 
 
@@ -435,7 +435,7 @@ def test_backtest_strategy_and_params_from_config(
     assert code == 0
     assert "Rapport de backtest : sma_cross" in out
     assert "fast=7, slow=21" in out
-    assert "Capital initial   : 2 500.00" in out
+    assert "Capital initial      : 2 500.00" in out
     assert "frais 0.20 %" in out
     # --param prime sur [strategy.params]
     code, out, _err = _run(
@@ -774,16 +774,19 @@ def test_paper_once_opens_position_and_prints_state(
     assert state["order"] == "paper-1"
     for key in ("timestamp", "signal", "action", "position", "equity", "reason"):
         assert key in state
-    # sma_cross n'émet son stop que sur la bougie d'entrée du croisement : un robot démarré
-    # en plein milieu d'une tendance entre donc SANS stop de stratégie, et la taille retombe
-    # sur max_position_fraction (95 %) ; prix d'exécution = ticker × (1 + glissement 0,05 %).
+    # sma_cross porte son stop ATR sur chaque bougie de la position : un robot démarré en
+    # plein milieu d'une tendance entre donc AVEC le stop de la stratégie, et la taille est
+    # basée sur le risque (1 % / distance au stop, plafonnée à 95 % de l'équité) ; prix
+    # d'exécution = ticker × (1 + glissement 0,05 %).
     last = fake_exchange.fetch_ticker("BTC/USDT")["last"]
-    assert state["stop_loss"] is None
-    assert state["amount"] == pytest.approx(0.95 * 1000.0 / last)
+    assert state["stop_loss"] is not None and 0 < state["stop_loss"] < last
+    expected_amount = min(0.95 * 1000.0 / last, 0.01 * 1000.0 / (last - state["stop_loss"]))
+    assert state["amount"] == pytest.approx(expected_amount, rel=2e-3)
+    assert state["amount"] * last <= 0.95 * 1000.0 * (1 + 1e-9)
     assert state["entry_price"] == pytest.approx(last * 1.0005)
     assert state["equity"] < 1000.0  # frais et glissement payés
 
-    broker_file = tmp_path / "state" / "paper_binance_BTC-USDT.json"
+    broker_file = tmp_path / "state" / "paper" / "binance_BTC-USDT_1h" / "account.json"
     assert broker_file.is_file()
     saved = json.loads(broker_file.read_text(encoding="utf-8"))
     assert len(saved["orders"]) == 1 and saved["orders"][0]["side"] == "buy"
@@ -808,7 +811,9 @@ def test_paper_once_twice_is_idempotent(
     assert state["reason"] == "bougie déjà traitée"
     assert state["position"] == 1
     saved = json.loads(
-        (tmp_path / "state" / "paper_binance_BTC-USDT.json").read_text(encoding="utf-8")
+        (tmp_path / "state" / "paper" / "binance_BTC-USDT_1h" / "account.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert len(saved["orders"]) == 1  # aucun ordre en double
 
@@ -859,11 +864,14 @@ def test_paper_once_stop_hit_on_restart(
 def test_paper_initial_cash_and_costs_overrides(
     fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # 5 000 et non 250 : avec le stop ATR de sma_cross (~90 USDT sous le prix) et 1 % de
+    # risque, une entrée sur 250 de capital ferait ~6,6 USDT de notionnel, sous le minimum
+    # de 10 USDT, donc aucun trade.
     code, out, _err = _run(
-        capsys, _paper_argv(tmp_path, "--initial-cash", "250", "--fee", "0", "--slippage", "0")
+        capsys, _paper_argv(tmp_path, "--initial-cash", "5000", "--fee", "0", "--slippage", "0")
     )
     assert code == 0
-    assert "cash 250.00" in out
+    assert "cash 5 000.00" in out
     state = json.loads(out[out.index("{") :])
     assert state["entry_price"] == pytest.approx(fake_exchange.fetch_ticker("BTC/USDT")["last"])
 
@@ -876,7 +884,7 @@ def test_paper_loop_with_max_iterations(
     assert code == 0
     assert "Boucle démarrée" in out
     assert len(fake_exchange.ohlcv_calls) == 2
-    assert (tmp_path / "state" / "paper_binance_BTC-USDT.json").is_file()
+    assert (tmp_path / "state" / "paper" / "binance_BTC-USDT_1h" / "account.json").is_file()
 
 
 def test_paper_short_signal_is_ignored_without_allow_short(

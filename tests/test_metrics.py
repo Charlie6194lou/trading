@@ -12,6 +12,7 @@ import pytest
 from tradingbot.backtest.metrics import (
     METRIC_KEYS,
     annual_volatility,
+    annualize_return,
     cagr,
     calmar_ratio,
     compute_metrics,
@@ -23,12 +24,17 @@ from tradingbot.backtest.metrics import (
     sharpe_ratio,
     sortino_ratio,
     win_rate,
+    years_elapsed,
 )
 
 
-def series(values: list[float]) -> pd.Series:
-    index = pd.date_range("2024-01-01", periods=len(values), freq="1D", tz="UTC")
+def series(values: list[float], freq: str | pd.Timedelta = "1D") -> pd.Series:
+    index = pd.date_range("2024-01-01", periods=len(values), freq=freq, tz="UTC")
     return pd.Series(values, index=index, dtype=float)
+
+
+#: 4 intervalles de 91 j 6 h = 365 jours exactement : 4 bougies par an « calendaires »
+QUARTER = pd.Timedelta(days=91, hours=6)
 
 
 def trades(
@@ -115,16 +121,55 @@ def test_drawdown_constant_or_empty() -> None:
 
 
 # ============================================================================ cagr / calmar
-def test_cagr_hand_computed() -> None:
+def test_cagr_hand_computed_from_bar_count() -> None:
+    """Sans index daté, le nombre d'années vaut ``(n - 1) / periods_per_year``."""
     # 100 → 121 en 2 périodes à 1 période / an : (1,21)^(1/2) - 1 = 10 %.
-    assert cagr(series([100, 110, 121]), periods_per_year=1) == pytest.approx(0.10)
+    assert cagr(np.array([100.0, 110.0, 121.0]), periods_per_year=1) == pytest.approx(0.10)
     # 100 → 121 en 2 périodes à 2 périodes / an : 1 an → 21 %.
-    assert cagr(series([100, 110, 121]), periods_per_year=2) == pytest.approx(0.21)
+    assert cagr(np.array([100.0, 110.0, 121.0]), periods_per_year=2) == pytest.approx(0.21)
+    # Series sans DatetimeIndex : même repli.
+    assert cagr(pd.Series([100.0, 90.0, 81.0]), periods_per_year=1) == pytest.approx(-0.10)
     # 100 → 200 en 365 bougies journalières → 100 %.
+    eq = np.array([100.0] + [150.0] * 364 + [200.0])
+    assert cagr(eq, periods_per_year=365) == pytest.approx(1.0)
+
+
+def test_cagr_hand_computed_from_elapsed_time() -> None:
+    """Avec un DatetimeIndex, le nombre d'années est le temps écoulé / 365 jours (F58)."""
+    # 366 clôtures journalières = 365 jours écoulés = 1 an : 100 → 200 → +100 %.
     eq = series([100.0] + [150.0] * 364 + [200.0])
     assert cagr(eq, periods_per_year=365) == pytest.approx(1.0)
-    # Perte : 100 → 81 en 2 ans → -10 % par an.
-    assert cagr(series([100, 90, 81]), periods_per_year=1) == pytest.approx(-0.10)
+    # periods_per_year n'intervient plus quand l'index est daté.
+    assert cagr(eq, periods_per_year=252) == pytest.approx(1.0)
+    # 5 points espacés d'un trimestre : 100 → 121 en 1 an → 21 %.
+    assert cagr(series([100, 105, 110, 115, 121], freq=QUARTER), 4) == pytest.approx(0.21)
+    # 731 clôtures = 730 jours écoulés = 2 ans : 100 → 81 → -10 % par an.
+    eq = series([100.0] + [90.0] * 729 + [81.0])
+    assert cagr(eq, periods_per_year=365) == pytest.approx(-0.10)
+
+
+def test_cagr_with_gaps_uses_elapsed_time_not_bar_count() -> None:
+    """F58 : 50 bougies horaires, deux mois de trou, 50 bougies : 100 → 110."""
+    idx = pd.DatetimeIndex(
+        list(pd.date_range("2024-01-01", periods=50, freq="1h", tz="UTC"))
+        + list(pd.date_range("2024-03-01", periods=50, freq="1h", tz="UTC"))
+    )
+    eq = pd.Series(np.linspace(100.0, 110.0, 100), index=idx)
+    years = (idx[-1] - idx[0]) / pd.Timedelta(days=365)
+    assert years_elapsed(eq, 8760) == pytest.approx(years)
+    assert cagr(eq, 8760) == pytest.approx(1.1 ** (1 / years) - 1)  # ≈ +75 %
+    # Sur le nombre de bougies (99 h), le même gain aurait donné un chiffre absurde.
+    assert cagr(eq.to_numpy(), 8760) > 1000
+
+
+def test_years_elapsed_fallbacks() -> None:
+    assert years_elapsed(series([1.0, 2.0, 3.0]), 365) == pytest.approx(2 / 365)
+    assert years_elapsed(np.array([1.0, 2.0, 3.0]), 4) == pytest.approx(0.5)
+    assert years_elapsed(np.array([1.0]), 4) == 0.0
+    assert years_elapsed(np.array([1.0, 2.0]), 0) == 0.0
+    # Index daté mais horodatages identiques : repli sur le nombre de bougies.
+    same = pd.Series([1.0, 2.0], index=pd.DatetimeIndex(["2024-01-01", "2024-01-01"], tz="UTC"))
+    assert years_elapsed(same, 2) == pytest.approx(0.5)
 
 
 def test_cagr_degenerate_cases() -> None:
@@ -133,6 +178,44 @@ def test_cagr_degenerate_cases() -> None:
     assert cagr(series([0, 100]), 365) == 0.0
     assert cagr(series([100, 0]), 365) == -1.0
     assert cagr(series([100, 100, 100]), 365) == 0.0
+
+
+def test_cagr_never_raises_on_huge_growth() -> None:
+    """F40 / F53 : ``float ** float`` levait OverflowError ; on renvoie ``inf``."""
+    assert cagr(pd.Series([100.0, 130.0]), 525_600) == math.inf
+    assert cagr(np.array([100.0, 200.0]), 525_600) == math.inf
+    assert cagr(np.array([100.0, 300.0]), 8_760) == math.inf
+    eq = series([100.0, 130.0], freq="1min")
+    assert cagr(eq, 525_600) == math.inf
+    # +10 % sur 3 bougies horaires (2 intervalles) : 1.1 ** 4380 ≈ 2e181, représentable.
+    assert cagr(np.array([100.0, 105.0, 110.0]), 8_760) == pytest.approx(1.1**4380 - 1)
+    # Sur un seul intervalle, 1.1 ** 8760 dépasse la plage des float → inf, pas d'exception.
+    assert cagr(np.array([100.0, 110.0]), 8_760) == math.inf
+    # Le Calmar d'un CAGR infini vaut 0 (convention « valeur neutre »).
+    assert calmar_ratio(math.inf, -0.1) == 0.0
+
+
+def test_annualize_return_hand_computed() -> None:
+    assert annualize_return(0.21, 1.0) == pytest.approx(0.21)
+    assert annualize_return(0.21, 2.0) == pytest.approx(0.10)
+    assert annualize_return(1.0, 0.5) == pytest.approx(3.0)  # ×2 en 6 mois = ×4 par an
+    assert annualize_return(-0.19, 2.0) == pytest.approx(-0.10)
+    assert annualize_return(0.3, 2 / 525_600) == math.inf
+    assert annualize_return(-1.0, 1.0) == -1.0
+    assert annualize_return(-1.5, 1.0) == -1.0
+    assert annualize_return(0.5, 0.0) == 0.0
+    assert annualize_return(math.nan, 1.0) == 0.0
+
+
+def test_compute_metrics_never_raises_on_short_high_gain_series() -> None:
+    """F40 : run_backtest / walk_forward plantaient via compute_metrics."""
+    eq = series([100.0, 130.0], freq="1min")
+    m = compute_metrics(eq, None, periods_per_year=525_600, benchmark=eq)
+    assert m["cagr"] == math.inf
+    assert m["calmar"] == 0.0
+    assert m["total_return"] == pytest.approx(0.30)
+    assert m["buy_hold_return"] == pytest.approx(0.30)
+    json.dumps(m)  # inf reste sérialisable (le rapport l'écrit null)
 
 
 def test_calmar_ratio() -> None:
@@ -173,9 +256,10 @@ def test_exposure() -> None:
 def test_compute_metrics_hand_computed() -> None:
     # Équité : 100 → 110 → 99 → 108,9 → 120. Rendements (avec le 0 initial) :
     # [0, 0.1, -0.1, 0.1, 0.1019...]. Plus haut 110 à l'indice 1, creux 99 → -10 %.
-    eq = series([100, 110, 99, 108.9, 120])
+    # Index trimestriel : 4 intervalles = 365 jours = 1 an (cohérent avec ppy = 4).
+    eq = series([100, 110, 99, 108.9, 120], freq=QUARTER)
     tr = trades(pnl=[10, -11, 9.9, 11.1], pnl_pct=[0.1, -0.1, 0.1, 0.1], bars=[1, 1, 1, 1])
-    bench = series([50, 55, 60, 58, 75])
+    bench = series([50, 55, 60, 58, 75], freq=QUARTER)
     m = compute_metrics(eq, tr, periods_per_year=4, benchmark=bench)
 
     assert set(m) == set(METRIC_KEYS)

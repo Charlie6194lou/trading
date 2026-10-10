@@ -8,7 +8,18 @@ Garde-fous :
   ``create_order(symbol, "market", side, amount)`` est utilisé pour trader ;
 - montant arrondi à la précision du marché (``amount_to_precision``) puis vérifié
   contre les minimums ``limits.amount.min`` et ``limits.cost.min`` du marché ;
-- toute exception ``ccxt.BaseError`` est encapsulée dans ``BrokerError``.
+- toute exception ``ccxt.BaseError`` est encapsulée dans ``BrokerError``, après
+  **masquage des secrets** (:func:`scrub_secrets`) : certains exchanges signent via la
+  chaîne de requête et ccxt recopie l'URL complète dans ses messages d'erreur ;
+- statut des ordres : une réponse ``canceled`` / ``rejected`` / ``expired`` **sans
+  exécution** lève ``BrokerError`` (rien n'a été acheté ni vendu) ; partiellement
+  exécutée, elle renvoie un :class:`~tradingbot.execution.broker.Order` de statut
+  ``"partial"`` dont ``amount`` est la quantité réellement exécutée ;
+- une quantité détenue inférieure au minimum du marché (``amount.min``) **ou** dont la
+  valeur est sous ``cost.min`` (« poussière » invendable) est considérée plate ;
+- sur les exchanges dont ``options["createMarketBuyOrderRequiresPrice"]`` est vrai
+  (Coinbase, Gate...), le prix de référence est transmis à ``create_order`` pour les
+  achats au marché (ccxt convertit lui-même la quantité en montant à dépenser).
 
 L'objet ``exchange`` est injectable (faux exchange dans les tests) : ``ccxt`` n'est
 instancié que lorsqu'il vaut ``None``. Les marchés sont chargés paresseusement au
@@ -22,7 +33,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterator
+import re
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -34,6 +46,8 @@ from tradingbot.execution.paper import apply_fill, check_order_args
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["SECRET_MASK", "CcxtBroker", "scrub_secrets", "split_symbol"]
+
 #: correspondance statut ccxt → statut :class:`Order`
 _STATUS_MAP = {
     "closed": "filled",
@@ -44,18 +58,45 @@ _STATUS_MAP = {
     "rejected": "rejected",
     "expired": "rejected",
 }
+#: marque qui remplace un secret dans les messages d'erreur et le journal
+SECRET_MASK = "***"
+#: paramètres d'URL qui transportent une clé ou une signature (exchanges signant par la
+#: chaîne de requête : htx, bithumb, upbit...)
+_SECRET_QUERY_RE = re.compile(
+    r"([?&](?:AccessKeyId|api_key|apiKey|apikey|key|access_key|secret|signature|sign)=)[^&\s]+",
+    re.IGNORECASE,
+)
+#: chaîne de requête complète d'une URL (horodatage, signature... sans valeur pour l'utilisateur)
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?\"'<>]+)\?[^\s\"'<>]*")
+
+
+def scrub_secrets(text: str, secrets: Iterable[str | None] = ()) -> str:
+    """Masque les secrets dans ``text`` : chaque valeur de ``secrets`` est remplacée par
+    ``***``, les paramètres d'URL sensibles (``AccessKeyId=``, ``Signature=``...) sont
+    masqués et la chaîne de requête de toute URL ``http(s)://`` est tronquée."""
+    out = str(text)
+    for secret in secrets:
+        if secret and str(secret).strip():
+            out = out.replace(str(secret), SECRET_MASK)
+    out = _SECRET_QUERY_RE.sub(rf"\1{SECRET_MASK}", out)
+    return _URL_QUERY_RE.sub(rf"\1?{SECRET_MASK}", out)
 
 
 @contextmanager
-def _wrap_ccxt(action: str) -> Iterator[None]:
-    """Transforme toute ``ccxt.BaseError`` levée dans le bloc en ``BrokerError`` (FR)."""
+def _wrap_ccxt(action: str, secrets: Iterable[str | None] = ()) -> Iterator[None]:
+    """Transforme toute ``ccxt.BaseError`` levée dans le bloc en ``BrokerError`` (FR), en
+    masquant les secrets dans le message (et dans l'exception d'origine, conservée comme
+    ``__cause__`` : une trace au niveau debug ne doit pas les révéler non plus)."""
     try:
         yield
     except BrokerError:
         raise
     except ccxt.BaseError as exc:
+        secrets = tuple(secrets)
+        exc.args = tuple(scrub_secrets(a, secrets) if isinstance(a, str) else a for a in exc.args)
         raise BrokerError(
-            f"Erreur de l'exchange pendant « {action} » : {type(exc).__name__}: {exc}"
+            f"Erreur de l'exchange pendant « {action} » : {type(exc).__name__}: "
+            f"{scrub_secrets(str(exc), secrets)}"
         ) from exc
 
 
@@ -107,7 +148,8 @@ class CcxtBroker(Broker):
 
     Paramètres :
     - ``exchange_id`` : identifiant ccxt (``"binance"``, ``"kraken"``...) ;
-    - ``api_key`` / ``api_secret`` : clés API (jamais journalisées) ;
+    - ``api_key`` / ``api_secret`` : clés API (jamais journalisées ; conservées en privé
+      uniquement pour être masquées dans les messages d'erreur) ;
     - ``sandbox`` : active le mode test de l'exchange (``set_sandbox_mode(True)``) ;
     - ``confirm_live`` : doit valoir True, sinon ``BrokerError`` ;
     - ``exchange`` : objet exchange déjà construit (fake dans les tests).
@@ -129,6 +171,9 @@ class CcxtBroker(Broker):
             )
         self.exchange_id = str(exchange_id)
         self.sandbox = bool(sandbox)
+        self._secrets: tuple[str, ...] = tuple(
+            str(x) for x in (api_key, api_secret) if x and str(x).strip()
+        )
         if exchange is None:
             exchange = self._build_exchange(self.exchange_id, api_key, api_secret)
         if self.sandbox:
@@ -137,7 +182,7 @@ class CcxtBroker(Broker):
                 raise BrokerError(
                     f"L'exchange {self.exchange_id!r} ne propose pas de mode sandbox."
                 )
-            with _wrap_ccxt("activation du mode sandbox"):
+            with self._wrap("activation du mode sandbox"):
                 set_sandbox(True)
         self.exchange = exchange
         self._markets: dict[str, Any] | None = None
@@ -146,21 +191,28 @@ class CcxtBroker(Broker):
             "CcxtBroker prêt sur %s (%s)", self.exchange_id, "sandbox" if self.sandbox else "RÉEL"
         )
 
-    @staticmethod
-    def _build_exchange(exchange_id: str, api_key: str, api_secret: str) -> Any:
+    def _build_exchange(self, exchange_id: str, api_key: str, api_secret: str) -> Any:
         if exchange_id not in ccxt.exchanges:
             raise BrokerError(
                 f"Exchange inconnu pour ccxt : {exchange_id!r} (exemples : binance, kraken, "
                 "coinbase, bybit)."
             )
         exchange_cls = getattr(ccxt, exchange_id)
-        with _wrap_ccxt(f"construction de l'exchange {exchange_id}"):
+        with self._wrap(f"construction de l'exchange {exchange_id}"):
             return exchange_cls({"apiKey": api_key, "secret": api_secret, "enableRateLimit": True})
+
+    def _wrap(self, action: str) -> Any:
+        """``_wrap_ccxt`` avec les secrets de ce broker à masquer."""
+        return _wrap_ccxt(action, self._secrets)
+
+    def scrub(self, text: str) -> str:
+        """Masque la clé et le secret API de ce broker dans ``text`` (voir :func:`scrub_secrets`)."""
+        return scrub_secrets(text, self._secrets)
 
     # ------------------------------------------------------------------ marchés
     def _load_markets(self) -> dict[str, Any]:
         if self._markets is None:
-            with _wrap_ccxt("chargement des marchés"):
+            with self._wrap("chargement des marchés"):
                 markets = self.exchange.load_markets()
             self._markets = dict(markets or {})
             logger.info(
@@ -177,7 +229,7 @@ class CcxtBroker(Broker):
     # ------------------------------------------------------------------ lecture
     def get_price(self, symbol: str) -> float:
         """Dernier prix via ``fetch_ticker`` (``last``, sinon ``close``)."""
-        with _wrap_ccxt(f"récupération du prix de {symbol}"):
+        with self._wrap(f"récupération du prix de {symbol}"):
             ticker = self.exchange.fetch_ticker(symbol)
         ticker = ticker if isinstance(ticker, dict) else {}
         for key in ("last", "close"):
@@ -189,7 +241,7 @@ class CcxtBroker(Broker):
         )
 
     def _fetch_balance(self) -> dict[str, Any]:
-        with _wrap_ccxt("récupération du solde"):
+        with self._wrap("récupération du solde"):
             balance = self.exchange.fetch_balance()
         return balance if isinstance(balance, dict) else {}
 
@@ -207,15 +259,32 @@ class CcxtBroker(Broker):
     def get_position(self, symbol: str) -> Position:
         """Position spot (longue uniquement) d'après le solde total de l'actif de base.
 
-        Une quantité inférieure au minimum négociable du marché (« poussière ») est
-        considérée comme plate. Le prix d'entrée vient du suivi local des exécutions
-        (0 si inconnu).
+        Une quantité inférieure au minimum négociable du marché (``limits.amount.min``),
+        ou dont la valeur au dernier prix est sous le notionnel minimal
+        (``limits.cost.min``), est de la « poussière » invendable : elle est considérée
+        comme plate. Le prix d'entrée vient du suivi local des exécutions (0 si inconnu).
         """
-        base, _ = split_symbol(symbol)
+        base, quote = split_symbol(symbol)
         amount = max(_balance_amount(self._fetch_balance(), "total", base), 0.0)
-        min_amount = _limit(self._market(symbol), "amount", "min")
+        market = self._market(symbol)
+        min_amount = _limit(market, "amount", "min")
         if min_amount is not None and amount < min_amount:
             amount = 0.0
+        min_cost = _limit(market, "cost", "min")
+        if amount > 0 and min_cost is not None:
+            value = amount * self.get_price(symbol)
+            if value < min_cost:
+                logger.debug(
+                    "Poussière ignorée sur %s : %.8g %s ≈ %.2f %s < minimum %g %s",
+                    symbol,
+                    amount,
+                    base,
+                    value,
+                    quote,
+                    min_cost,
+                    quote,
+                )
+                amount = 0.0
         if amount <= 0:
             self._tracked.pop(symbol, None)
             return Position(symbol)
@@ -231,7 +300,7 @@ class CcxtBroker(Broker):
         base, quote = split_symbol(symbol)
         market = self._market(symbol)
 
-        with _wrap_ccxt(f"arrondi du montant pour {symbol}"):
+        with self._wrap(f"arrondi du montant pour {symbol}"):
             rounded = self.exchange.amount_to_precision(symbol, amount)
         amount_p = _to_float(rounded)
         if amount_p is None or amount_p <= 0:
@@ -256,9 +325,19 @@ class CcxtBroker(Broker):
                     f"({min_cost:g} {quote}) pour {symbol} : ordre non envoyé."
                 )
 
+        needs_price = side == "buy" and self._market_buy_requires_price()
+        if needs_price and reference_price is None:
+            reference_price = self.get_price(symbol)
+
         logger.info("Envoi ordre %s %s %.8g %s", side, "market", amount_p, symbol)
-        with _wrap_ccxt(f"ordre {side} {amount_p:g} {symbol}"):
-            response = self.exchange.create_order(symbol, "market", side, amount_p)
+        with self._wrap(f"ordre {side} {amount_p:g} {symbol}"):
+            if needs_price:
+                # ccxt convertit lui-même quantité × prix en montant à dépenser (quote).
+                response = self.exchange.create_order(
+                    symbol, "market", side, amount_p, reference_price
+                )
+            else:
+                response = self.exchange.create_order(symbol, "market", side, amount_p)
         order = self._parse_order(
             response if isinstance(response, dict) else {},
             symbol=symbol,
@@ -267,6 +346,22 @@ class CcxtBroker(Broker):
             sent_amount=amount_p,
             reference_price=reference_price,
         )
+        if order.status == "rejected":
+            raise BrokerError(
+                f"Ordre {order.id} ({side} {amount_p:g} {symbol}) rejeté par l'exchange "
+                f"(statut {order.info.get('exchange_status')!r}) : aucune exécution, "
+                "rien n'a été acheté ni vendu."
+            )
+        if order.status == "partial":
+            logger.warning(
+                "Ordre %s %s exécuté partiellement : %.8g sur %.8g %s (statut %r)",
+                self.exchange_id,
+                order.id,
+                order.amount,
+                amount_p,
+                base,
+                order.info.get("exchange_status"),
+            )
         self._track_fill(order)
         logger.info(
             "Ordre %s %s : %s %.8g %s @ %.8g (frais %.4f %s, statut %s)",
@@ -282,6 +377,13 @@ class CcxtBroker(Broker):
         )
         return order
 
+    def _market_buy_requires_price(self) -> bool:
+        """True si l'exchange exige un prix pour un achat au marché (``options`` ccxt)."""
+        options = getattr(self.exchange, "options", None)
+        if not isinstance(options, dict):
+            return False
+        return bool(options.get("createMarketBuyOrderRequiresPrice", False))
+
     def _parse_order(
         self,
         response: dict[str, Any],
@@ -292,12 +394,24 @@ class CcxtBroker(Broker):
         sent_amount: float,
         reference_price: float | None,
     ) -> Order:
-        """Convertit la réponse ccxt de ``create_order`` en :class:`Order`."""
+        """Convertit la réponse ccxt de ``create_order`` en :class:`Order`.
+
+        Statut : ``"filled"`` (ou ``"open"``) selon la réponse ; ``"rejected"`` si
+        l'exchange a annulé / rejeté l'ordre sans rien exécuter (``amount`` = 0) ;
+        ``"partial"`` s'il l'a annulé après une exécution partielle (``amount`` = quantité
+        exécutée). Une réponse acceptée sans champ ``filled`` suppose ``sent_amount``.
+        """
         base, quote = split_symbol(symbol)
         timestamp = self._parse_timestamp(response)
 
+        raw_status = response.get("status")
+        status = _STATUS_MAP.get(str(raw_status).lower(), "filled") if raw_status else "filled"
         filled = _to_float(response.get("filled"))
-        if filled is None or filled <= 0:
+        if status == "rejected":
+            filled = max(filled or 0.0, 0.0)
+            if filled > 0:
+                status = "partial"
+        elif filled is None or filled <= 0:
             logger.warning(
                 "Réponse de l'exchange sans quantité exécutée pour %s ; on suppose %.8g",
                 symbol,
@@ -310,7 +424,7 @@ class CcxtBroker(Broker):
             price = _to_float(response.get("price"))
         if price is None or price <= 0:
             cost = _to_float(response.get("cost"))
-            price = cost / filled if cost is not None and cost > 0 else None
+            price = cost / filled if cost is not None and cost > 0 and filled > 0 else None
         if price is None or price <= 0:
             price = reference_price if reference_price is not None else self.get_price(symbol)
 
@@ -326,8 +440,6 @@ class CcxtBroker(Broker):
             )
             fee_cost = 0.0
 
-        raw_status = response.get("status")
-        status = _STATUS_MAP.get(str(raw_status).lower(), "filled") if raw_status else "filled"
         order_id = response.get("id")
         order_id = (
             str(order_id)
@@ -389,8 +501,9 @@ class CcxtBroker(Broker):
         return 0.0, None
 
     def _track_fill(self, order: Order) -> None:
-        """Suivi local du prix d'entrée (spot long) à partir des exécutions de ce broker."""
-        if order.status == "rejected" or order.amount <= 0:
+        """Suivi local du prix d'entrée (spot long) à partir des exécutions de ce broker
+        (toute quantité réellement exécutée compte, même sur un ordre partiel)."""
+        if order.amount <= 0:
             return
         delta = order.amount if order.side == "buy" else -order.amount
         current = self._tracked.get(order.symbol, Position(order.symbol))

@@ -10,6 +10,8 @@ Conventions :
 - ``equity`` : ``pd.Series`` de la valeur du portefeuille à chaque bougie.
 - ``returns`` : rendements par bougie (``equity.pct_change().fillna(0)``).
 - ``periods_per_year`` : nombre de bougies par an (8760 pour du 1h en crypto, 365 en 1d).
+  Sert à annualiser la volatilité, le Sharpe et le Sortino ; pour le CAGR, le nombre
+  d'années est de préférence lu sur l'index (temps écoulé, voir :func:`cagr`).
 - ``risk_free`` : taux sans risque **annuel** (fraction), converti par bougie en
   ``risk_free / periods_per_year``.
 - ``trades`` : ``pd.DataFrame`` avec au moins ``pnl`` (gain net en devise) ; ``pnl_pct``
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "annual_volatility",
+    "annualize_return",
     "cagr",
     "calmar_ratio",
     "compute_metrics",
@@ -39,6 +42,7 @@ __all__ = [
     "sharpe_ratio",
     "sortino_ratio",
     "win_rate",
+    "years_elapsed",
 ]
 
 METRIC_KEYS: tuple[str, ...] = (
@@ -63,6 +67,12 @@ METRIC_KEYS: tuple[str, ...] = (
     "buy_hold_return",
     "final_equity",
 )
+
+
+#: durée d'une année pour le temps écoulé (marché crypto : 365 jours, comme le moteur)
+YEAR = pd.Timedelta(days=365)
+#: au-delà de cet exposant, ``exp`` dépasse la plage des float : le CAGR vaut ``inf``
+_MAX_LOG_GROWTH = 700.0
 
 
 # --------------------------------------------------------------------------- utilitaires
@@ -194,23 +204,70 @@ def sortino_ratio(
     return _safe(float(np.mean(excess)) / downside * math.sqrt(periods_per_year))
 
 
+def years_elapsed(equity: pd.Series | np.ndarray, periods_per_year: float) -> float:
+    """Durée couverte par ``equity`` en années.
+
+    Si ``equity`` est une ``Series`` à ``DatetimeIndex`` (au moins 2 points, temps écoulé
+    > 0), c'est le temps réellement écoulé entre le premier et le dernier point divisé par
+    365 jours : des données avec des trous (panne d'exchange, fichiers concaténés) ne sont
+    pas annualisées comme si les bougies étaient contiguës. Sinon, repli sur le nombre de
+    bougies : ``(len - 1) / periods_per_year`` (``0.0`` si ``periods_per_year <= 0``).
+    """
+    n_periods = len(equity) - 1
+    if n_periods <= 0:
+        return 0.0
+    if isinstance(equity, pd.Series) and isinstance(equity.index, pd.DatetimeIndex):
+        try:
+            elapsed = pd.Timestamp(equity.index[-1]) - pd.Timestamp(equity.index[0])
+        except (TypeError, ValueError):  # pragma: no cover - index exotique
+            elapsed = pd.NaT
+        if elapsed is not pd.NaT and elapsed > pd.Timedelta(0):
+            return float(elapsed / YEAR)
+    if periods_per_year <= 0:
+        return 0.0
+    return n_periods / float(periods_per_year)
+
+
+def annualize_return(total_return: float, years: float) -> float:
+    """Rendement annualisé équivalent à ``total_return`` obtenu en ``years`` années.
+
+    Calcul en espace logarithmique, donc **ne lève jamais** : ``(1 + r)^(1/years) - 1``
+    vaut ``inf`` quand il dépasse la plage des ``float`` (fort gain sur très peu de temps)
+    au lieu de lever ``OverflowError``. ``0.0`` si ``years <= 0`` ou ``r`` non fini ;
+    ``-1.0`` si ``r <= -1`` (capital perdu).
+    """
+    r = float(total_return)
+    if not math.isfinite(r) or years <= 0 or not math.isfinite(years):
+        return 0.0
+    if r <= -1.0:
+        return -1.0
+    log_growth = math.log1p(r) / years
+    if log_growth > _MAX_LOG_GROWTH:
+        return math.inf
+    return _safe(math.expm1(log_growth))
+
+
 def cagr(equity: pd.Series | np.ndarray, periods_per_year: float) -> float:
     """Taux de croissance annualisé entre la première et la dernière équité.
 
-    Le nombre d'années vaut ``(len(equity) - 1) / periods_per_year``. ``0.0`` si moins de
-    2 points ou équité initiale nulle ; ``-1.0`` si l'équité finale est ≤ 0.
+    Le nombre d'années vient de :func:`years_elapsed` : temps écoulé sur l'index quand
+    ``equity`` est une ``Series`` datée, sinon ``(len(equity) - 1) / periods_per_year``.
+    ``0.0`` si moins de 2 points ou équité initiale nulle ; ``-1.0`` si l'équité finale est
+    ≤ 0 ; ``inf`` (jamais d'exception) si la croissance annualisée dépasse la plage des
+    ``float`` (voir :func:`annualize_return`).
     """
     eq = np.asarray(equity, dtype=np.float64).ravel()
-    n_periods = eq.size - 1
-    if n_periods <= 0 or periods_per_year <= 0:
+    if eq.size < 2:
         return 0.0
     first, last = float(eq[0]), float(eq[-1])
     if not math.isfinite(first) or not math.isfinite(last) or first <= 0:
         return 0.0
     if last <= 0:
         return -1.0
-    years = n_periods / periods_per_year
-    return _safe((last / first) ** (1.0 / years) - 1.0)
+    years = years_elapsed(equity, periods_per_year)
+    if years <= 0:
+        return 0.0
+    return annualize_return(last / first - 1.0, years)
 
 
 def calmar_ratio(cagr_value: float, max_dd: float) -> float:
@@ -266,15 +323,16 @@ def compute_metrics(
     :param equity: valeur du portefeuille à chaque bougie.
     :param trades: une ligne par trade (colonnes ``pnl``, ``pnl_pct``, ``bars_held``…) ;
         peut être vide ou ``None``.
-    :param periods_per_year: bougies par an (8760 en 1h, 365 en 1d).
+    :param periods_per_year: bougies par an (8760 en 1h, 365 en 1d) ; le CAGR utilise de
+        préférence le temps écoulé sur l'index de ``equity`` (:func:`years_elapsed`).
     :param risk_free: taux sans risque annuel (fraction).
     :param benchmark: série de prix (ex. ``close``) ; ajoute ``buy_hold_return``.
     :param positions: position tenue à chaque bougie (-1/0/1) ; si fournie, ``exposure``
         est la fraction de bougies où elle est non nulle. Sinon, ``exposure`` est estimée
         à partir de ``bars_held`` des trades.
     :returns: dict de ``float``/``int`` Python, clés ``METRIC_KEYS`` (``buy_hold_return``
-        seulement si ``benchmark`` est fourni). Ne lève jamais pour des entrées vides ou
-        une équité constante.
+        seulement si ``benchmark`` est fourni). Ne lève jamais : entrées vides, équité
+        constante ou croissance hors plage (``cagr = inf``, ``calmar = 0``) sont tolérées.
     """
     eq = np.asarray(equity, dtype=np.float64).ravel() if equity is not None else np.empty(0)
     n_bars = int(eq.size)
@@ -286,7 +344,7 @@ def compute_metrics(
 
     equity_series = equity if isinstance(equity, pd.Series) else pd.Series(eq)
     mdd = max_drawdown(equity_series)
-    growth = cagr(eq, periods_per_year)
+    growth = cagr(equity_series, periods_per_year)
 
     n_trades = int(_trade_column(trades, "pnl").size)
     pnl, pnl_pct = _trade_pnl_pairs(trades)

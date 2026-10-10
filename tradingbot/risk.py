@@ -5,9 +5,16 @@ Le :class:`RiskManager` répond à deux questions :
 - **Combien acheter ?** (:meth:`RiskManager.position_size`) : on risque au plus
   ``risk_per_trade`` du capital si le stop est touché, sans jamais dépasser
   ``max_position_fraction`` du capital en notionnel.
+- **Où placer le stop ?** (:meth:`RiskManager.protective_stop`) : une position ne s'ouvre
+  **jamais** sans stop. Priorité : stop de la stratégie (s'il est du bon côté du prix),
+  puis ``stop_loss_pct`` de la configuration de backtest, puis un stop de secours à
+  ``default_stop_atr_mult × ATR(14)``, enfin un stop de dernier recours à
+  ``default_stop_pct`` du prix (avec un avertissement).
 - **A-t-on encore le droit de trader ?** (:meth:`RiskManager.can_open`) : le *kill switch*
   bloque définitivement après un drawdown trop important (jusqu'à :meth:`RiskManager.reset`),
-  et la limite de perte journalière bloque jusqu'au jour UTC suivant.
+  et la limite de perte journalière bloque jusqu'au jour UTC suivant. La limite
+  journalière n'a de sens qu'en intrajournalier : l'appelant la désactive via
+  :meth:`RiskManager.set_daily_limit_active` quand les bougies font un jour ou plus.
 
 Toutes les fractions sont exprimées en décimal (``0.01`` = 1 %), tous les montants
 dans la devise de cotation.
@@ -25,9 +32,12 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["RiskConfig", "RiskManager"]
+__all__ = ["DEFAULT_STOP_ATR_WINDOW", "RiskConfig", "RiskManager"]
 
 _ZERO_OFFSET = timedelta(0)
+_ONE_DAY = timedelta(days=1)
+#: fenêtre de l'ATR utilisé pour le stop de secours (``default_stop_atr_mult × ATR(14)``)
+DEFAULT_STOP_ATR_WINDOW = 14
 
 
 @dataclass
@@ -50,6 +60,10 @@ class RiskConfig:
     #: volatilité annualisée cible ; si définie, la taille est multipliée par
     #: ``min(1, vol_target / vol_réalisée)`` (jamais de levier)
     vol_target: float | None = None
+    #: stop de secours quand la stratégie n'en donne pas : ``prix ∓ mult × ATR(14)``
+    default_stop_atr_mult: float = 3.0
+    #: stop de dernier recours (fraction du prix) quand l'ATR est indisponible (NaN ou 0)
+    default_stop_pct: float = 0.05
 
 
 def _is_bad(x: float | None) -> bool:
@@ -92,14 +106,25 @@ class RiskManager:
         self._daily_locked: bool = False
         self._last_equity: float | None = None
         self._last_timestamp: datetime | None = None
+        # Décision du contexte d'appel (timeframe), pas un état : ni sérialisée, ni remise
+        # à zéro par reset().
+        self._daily_limit_active: bool = True
+        self._daily_limit_inactive_reason: str = ""
 
     # ------------------------------------------------------------------ config
     def _validate_config(self) -> None:
         cfg = self.config
         if _is_bad(cfg.risk_per_trade) or cfg.risk_per_trade <= 0:
             raise ValueError("risk_per_trade doit être un nombre strictement positif")
-        if _is_bad(cfg.max_position_fraction) or cfg.max_position_fraction <= 0:
-            raise ValueError("max_position_fraction doit être un nombre strictement positif")
+        if (
+            _is_bad(cfg.max_position_fraction)
+            or cfg.max_position_fraction <= 0
+            or cfg.max_position_fraction > 1
+        ):
+            raise ValueError(
+                "max_position_fraction doit être compris entre 0 (exclu) et 1 (inclus) : "
+                "1.0 = tout le capital, jamais de levier"
+            )
         if cfg.max_drawdown is not None and cfg.max_drawdown < 0:
             raise ValueError("max_drawdown doit être positif, 0 ou None")
         if cfg.daily_loss_limit is not None and cfg.daily_loss_limit < 0:
@@ -108,6 +133,10 @@ class RiskManager:
             raise ValueError("min_trade_notional doit être positif ou nul")
         if cfg.vol_target is not None and (_is_bad(cfg.vol_target) or cfg.vol_target <= 0):
             raise ValueError("vol_target doit être strictement positif ou None")
+        if _is_bad(cfg.default_stop_atr_mult) or cfg.default_stop_atr_mult <= 0:
+            raise ValueError("default_stop_atr_mult doit être un nombre strictement positif")
+        if _is_bad(cfg.default_stop_pct) or not (0 < cfg.default_stop_pct < 1):
+            raise ValueError("default_stop_pct doit être une fraction entre 0 et 1 (exclus)")
 
     @property
     def peak_equity(self) -> float | None:
@@ -118,6 +147,85 @@ class RiskManager:
     def day_start_equity(self) -> float | None:
         """Équité de référence du jour UTC courant."""
         return self._day_start_equity
+
+    @property
+    def daily_limit_active(self) -> bool:
+        """False si l'appelant a désactivé la limite journalière (bougies >= 1 jour)."""
+        return self._daily_limit_active
+
+    @property
+    def daily_limit_inactive_reason(self) -> str:
+        """Raison de la désactivation (chaîne vide si la limite est active)."""
+        return self._daily_limit_inactive_reason
+
+    def set_daily_limit_active(self, active: bool, reason: str = "") -> None:
+        """Active / désactive la limite de perte journalière pour ce contexte d'exécution.
+
+        La limite journalière compare l'équité à celle du début du jour UTC : sur des
+        bougies d'un jour ou plus, chaque bougie est un nouveau jour et une seule bougie
+        à -5 % la déclencherait à tort. Le moteur de backtest et le ``LiveTrader``
+        appellent cette méthode d'après le timeframe. Désactivée, la limite ne se
+        verrouille jamais (:meth:`update`), :meth:`daily_limit_hit` renvoie toujours
+        ``False`` et :meth:`can_open` ne la vérifie plus. Ce choix n'est ni sérialisé par
+        :meth:`state` ni effacé par :meth:`reset` : il dépend du timeframe, pas de
+        l'historique.
+        """
+        self._daily_limit_active = bool(active)
+        self._daily_limit_inactive_reason = "" if active else str(reason)
+        if not active:
+            self._daily_locked = False
+
+    # ------------------------------------------------------------------ stop
+    def protective_stop(
+        self,
+        side: int,
+        price: float,
+        strategy_stop: float | None = None,
+        atr: float | None = None,
+        stop_loss_pct: float | None = None,
+    ) -> float:
+        """Prix du stop protecteur d'une entrée : une position ne s'ouvre jamais sans stop.
+
+        Ordre de priorité :
+
+        1. ``strategy_stop`` s'il est fini **et du bon côté** du prix d'entrée (long :
+           ``stop < price`` ; short : ``stop > price``) ;
+        2. ``stop_loss_pct`` (ex. ``BacktestConfig.stop_loss_pct``) s'il est fourni et > 0 :
+           ``price × (1 ∓ stop_loss_pct)`` ;
+        3. ``price ∓ default_stop_atr_mult × atr`` si ``atr`` est fini et > 0 (ATR(14) des
+           bougies déjà clôturées, voir ``DEFAULT_STOP_ATR_WINDOW``) ;
+        4. sinon ``price × (1 ∓ default_stop_pct)``, avec un avertissement journalisé.
+
+        :param side: +1 long, -1 short.
+        :param price: prix d'exécution prévu (slippage inclus), strictement positif.
+        :raises ValueError: ``side`` hors de {-1, 1} ou ``price`` invalide.
+        """
+        if side not in (1, -1):
+            raise ValueError(f"side doit valoir 1 (long) ou -1 (short), reçu {side!r}")
+        if _is_bad(price) or price <= 0:
+            raise ValueError(f"price doit être un nombre strictement positif, reçu {price!r}")
+        cfg = self.config
+        if not _is_bad(strategy_stop):
+            if (side == 1 and strategy_stop < price) or (side == -1 and strategy_stop > price):  # type: ignore[operator]
+                return float(strategy_stop)  # type: ignore[arg-type]
+            logger.debug(
+                "Stop de la stratégie %.6g du mauvais côté du prix %.6g (side %d) : ignoré",
+                strategy_stop,
+                price,
+                side,
+            )
+        if stop_loss_pct is not None and not _is_bad(stop_loss_pct) and stop_loss_pct > 0:
+            return float(price * (1.0 - side * stop_loss_pct))
+        if not _is_bad(atr) and atr > 0:  # type: ignore[operator]
+            return float(price - side * cfg.default_stop_atr_mult * atr)  # type: ignore[operator]
+        logger.warning(
+            "Aucun stop de stratégie et ATR indisponible : stop de dernier recours à %.1f %% "
+            "du prix %.6g (side %d)",
+            cfg.default_stop_pct * 100,
+            price,
+            side,
+        )
+        return float(price * (1.0 - side * cfg.default_stop_pct))
 
     # ------------------------------------------------------------------ sizing
     def position_size(
@@ -162,7 +270,15 @@ class RiskManager:
         ts = _to_utc(timestamp)
         day = ts.date()
         if self._day is None or day != self._day:
-            self.reset_daily(ts, equity if self._last_equity is None else self._last_equity)
+            # Référence du jour = dernière équité connue (clôture de la veille)... sauf si
+            # elle date de plus d'un jour (redémarrage après une coupure, bougies espacées) :
+            # elle ne décrit plus le début de ce jour, on prend l'équité courante.
+            stale = (
+                self._last_equity is None
+                or self._last_timestamp is None
+                or ts - self._last_timestamp > _ONE_DAY
+            )
+            self.reset_daily(ts, equity if stale else self._last_equity)
         self._last_timestamp = ts
         self._last_equity = float(equity)
 
@@ -180,7 +296,9 @@ class RiskManager:
                 dd * 100,
                 max_dd * 100,
             )
-        if self._daily_loss(equity) > (self.config.daily_loss_limit or math.inf):
+        if self._daily_limit_active and self._daily_loss(equity) > (
+            self.config.daily_loss_limit or math.inf
+        ):
             if not self._daily_locked:
                 logger.info(
                     "Limite de perte journalière atteinte à %s (%.2f %%)",
@@ -208,9 +326,10 @@ class RiskManager:
         """True si la limite de perte journalière bloque le trading à ``timestamp``.
 
         Ne modifie pas l'état : un horodatage appartenant à un autre jour UTC que le jour
-        suivi renvoie False (la limite est remise à zéro par :meth:`update`).
+        suivi renvoie False (la limite est remise à zéro par :meth:`update`). Toujours
+        False si la limite est désactivée (config ou :meth:`set_daily_limit_active`).
         """
-        if not self.config.daily_loss_limit:
+        if not self.config.daily_loss_limit or not self._daily_limit_active:
             return False
         day = _to_utc(timestamp).date()
         if self._day is None or day != self._day:
@@ -286,7 +405,8 @@ class RiskManager:
     def __repr__(self) -> str:
         return (
             f"RiskManager(peak={self._peak_equity}, kill_switch={self._kill_switch}, "
-            f"day={self._day}, daily_locked={self._daily_locked})"
+            f"day={self._day}, daily_locked={self._daily_locked}, "
+            f"daily_limit_active={self._daily_limit_active})"
         )
 
 

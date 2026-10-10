@@ -14,8 +14,9 @@ Règles (position souhaitée pour la bougie suivante) :
 - Jamais de ``-1`` (achat uniquement) ; ``0`` tant que les indicateurs ne sont pas
   définis (période de chauffe).
 
-Stop : sur la bougie d'entrée uniquement, ``stop_loss = close - atr_mult * ATR`` ;
-``NaN`` ailleurs. La logique est une petite machine à états parcourue dans l'ordre du
+Stop : sur la bougie d'entrée, ``stop_loss = close - atr_mult * ATR`` ; ce stop d'entrée
+est ensuite porté tel quel sur chaque bougie tant que la position est tenue (``NaN`` quand
+le signal est 0). La logique est une petite machine à états parcourue dans l'ordre du
 temps : la bougie ``t`` ne dépend que des données ``<= t`` (aucun look-ahead).
 """
 
@@ -136,6 +137,7 @@ class RsiReversion(Strategy):
 
         pos = 0
         entry_t = -1
+        cur_stop = np.nan  # stop d'entrée porté pendant toute la position
         n_entries = 0
         for t in range(n):
             if not valid[t]:
@@ -146,12 +148,14 @@ class RsiReversion(Strategy):
                     pos = 0  # bougie de sortie : plate, pas de ré-entrée immédiate
                     continue
                 signal[t] = 1
+                stop[t] = cur_stop
                 continue
             if rsi[t] < oversold and close[t] > trend[t]:
                 pos = 1
                 entry_t = t
+                cur_stop = close[t] - mult * atr[t]
                 signal[t] = 1
-                stop[t] = close[t] - mult * atr[t]
+                stop[t] = cur_stop
                 n_entries += 1
 
         logger.debug(

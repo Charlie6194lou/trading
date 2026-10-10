@@ -5,18 +5,38 @@ Principe (voir ``docs/ARCHITECTURE.md``, section « Règles du moteur ») :
 1. La position tenue pendant la bougie ``t`` a été décidée à la clôture de ``t-1``
    (``signal[t-1]``). Les changements s'exécutent à ``open[t]`` ± slippage, avec des
    frais de ``notionnel × fee_rate`` sur chaque ordre.
-2. Stop et take-profit sont vérifiés sur chaque bougie où une position est tenue : si
-   l'ouverture est déjà au-delà du niveau (gap) la sortie se fait à l'ouverture, sinon au
-   niveau exact. Stop et take-profit touchés dans la même bougie → on suppose le stop.
-3. La taille vient de ``risk.position_size(équité, prix d'exécution, stop)`` où l'équité
-   est celle de la clôture précédente.
-4. Le kill switch du :class:`~tradingbot.risk.RiskManager` ferme la position à l'ouverture
+2. Stop et take-profit sont vérifiés sur chaque bougie où une position est tenue, dans
+   cet ordre : gap d'ouverture au-delà du stop (sortie à ``open``), gap d'ouverture
+   au-delà du take-profit (sortie à ``open`` : l'ouverture est le premier prix connu,
+   l'ambiguïté est levée), puis touches intrabar : stop (au niveau exact) avant
+   take-profit. Stop et take-profit touchés **intrabar** dans la même bougie → on suppose
+   le stop (pessimiste).
+3. Une position ne s'ouvre **jamais** sans stop : ``risk.protective_stop(side, prix
+   d'exécution, stop de la stratégie, ATR(14) des bougies ≤ t-1, stop_loss_pct)`` choisit,
+   dans l'ordre, le stop de la stratégie (s'il est du bon côté du prix), ``stop_loss_pct``,
+   un stop à ``default_stop_atr_mult × ATR`` ou, à défaut, ``default_stop_pct``. La taille
+   vient de ``risk.position_size(équité, prix d'exécution, stop)`` où l'équité est celle
+   de la clôture précédente : le sizing est donc toujours basé sur le risque (plafonné par
+   ``max_position_fraction``).
+4. Ré-entrée après une sortie décidée par le moteur (``stop_loss``, ``take_profit``,
+   ``daily_limit``) : avec ``reentry_after_stop = "wait"`` (défaut) ce côté est bloqué
+   tant que le signal brut n'a pas quitté ce côté au moins une fois (0 ou côté opposé) ;
+   une nouvelle transition ouvre à nouveau. ``"immediate"`` = ré-ouverture dès la bougie
+   suivante si le signal le demande encore.
+5. Le kill switch du :class:`~tradingbot.risk.RiskManager` ferme la position à l'ouverture
    suivante (``exit_reason = "kill_switch"``) et bloque toute réouverture ; la limite de
-   perte journalière fait de même (``"daily_limit"``) jusqu'au jour UTC suivant.
-5. Les bougies de chauffe ne tradent pas.
-6. ``equity[t] = cash + position × close[t]`` ; la dernière position est fermée à la
+   perte journalière fait de même (``"daily_limit"``) jusqu'au jour UTC suivant. La
+   limite journalière n'a de sens qu'en intrajournalier : si la bougie médiane fait un
+   jour ou plus, elle est désactivée (``RiskManager.set_daily_limit_active(False)``,
+   ``BacktestResult.daily_limit_active = False``, journalisé en INFO). Chaque
+   déclenchement est consigné dans ``BacktestResult.events``.
+6. Les bougies de chauffe ne tradent pas.
+7. ``equity[t] = cash + position × close[t]`` ; la dernière position est fermée à la
    dernière clôture (``"end"``).
-7. Sans ``allow_short`` (config **et** risque), les signaux -1 valent 0.
+8. Sans ``allow_short`` (config **et** risque), les signaux -1 valent 0.
+9. Le buy & hold de référence (``metrics["buy_hold_return"]``) est mesuré sur la période
+   réellement tradable par la stratégie (``open[warmup+1]`` → dernière clôture, ou toute
+   la série si ``warmup = 0``), net d'un aller-retour de frais et de slippage.
 
 Aucun look-ahead : à la bougie ``t`` seules les données ≤ ``t`` sont utilisées pour
 décider, et la décision s'applique à ``t+1``.
@@ -33,8 +53,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 
+from tradingbot import indicators as ind
 from tradingbot.backtest import metrics as metrics_mod
-from tradingbot.risk import RiskConfig, RiskManager
+from tradingbot.risk import DEFAULT_STOP_ATR_WINDOW, RiskConfig, RiskManager
 
 if TYPE_CHECKING:
     from tradingbot.strategies.base import Strategy
@@ -66,6 +87,12 @@ EXIT_REASONS: tuple[str, ...] = (
     "kill_switch",
     "daily_limit",
 )
+#: politiques de ré-entrée après une sortie décidée par le moteur (cf. règle 4)
+REENTRY_POLICIES: tuple[str, ...] = ("wait", "immediate")
+#: sorties décidées par le moteur qui bloquent la ré-entrée du même côté (politique "wait")
+ENGINE_EXIT_REASONS: frozenset[str] = frozenset({"stop_loss", "take_profit", "daily_limit"})
+#: types d'événements de garde-fous consignés dans ``BacktestResult.events``
+EVENT_TYPES: tuple[str, ...] = ("kill_switch", "daily_limit")
 #: fenêtre (en bougies) de la volatilité réalisée utilisée pour le ciblage de volatilité
 VOL_WINDOW = 20
 #: nombre de secondes dans une année crypto (marché ouvert 24 h/24, 365 j/an)
@@ -92,6 +119,10 @@ class BacktestConfig:
     allow_short: bool = False
     #: moment d'exécution ; seule la valeur ``"next_open"`` est supportée
     execute_on: str = "next_open"
+    #: après une sortie décidée par le moteur (stop, objectif, limite journalière) :
+    #: ``"wait"`` = ne pas ré-ouvrir ce côté tant que le signal ne l'a pas quitté une fois ;
+    #: ``"immediate"`` = ré-ouvrir dès la bougie suivante si le signal le demande encore
+    reentry_after_stop: str = "wait"
 
 
 @dataclass
@@ -128,6 +159,27 @@ class BacktestResult:
     metrics: dict[str, float | int]
     signals: pd.DataFrame
     periods_per_year: float = field(default=365.0)
+    #: garde-fous déclenchés : dicts ``{timestamp (ISO), type ("kill_switch" |
+    #: "daily_limit"), equity, drawdown (fraction positive), detail (texte FR)}``
+    events: list[dict[str, Any]] = field(default_factory=list)
+    #: bougies de chauffe de la stratégie (``strategy.warmup_bars()``) ; le buy & hold de
+    #: référence démarre à ``open[warmup_bars + 1]`` (ou à la première bougie si 0)
+    warmup_bars: int = 0
+    #: False si la limite de perte journalière a été désactivée (bougies >= 1 jour)
+    daily_limit_active: bool = True
+
+    def guard_rails_text(self) -> str:
+        """Résumé en une ligne des garde-fous (vide si rien à signaler)."""
+        parts: list[str] = []
+        kills = [e for e in self.events if e.get("type") == "kill_switch"]
+        if kills:
+            parts.append(f"kill switch le {_fmt_ts(kills[0].get('timestamp'))}")
+        n_daily = sum(1 for e in self.events if e.get("type") == "daily_limit")
+        if n_daily:
+            parts.append(f"limite journalière atteinte {n_daily} jour(s)")
+        if not self.daily_limit_active:
+            parts.append("limite journalière inactive (bougies >= 1 jour)")
+        return " ; ".join(parts)
 
     def summary(self) -> str:
         """Tableau texte (français) des principales métriques."""
@@ -180,7 +232,12 @@ class BacktestResult:
             ),
         ]
         if "buy_hold_return" in m:
-            rows.append(("Buy & hold", _fmt_pct(m["buy_hold_return"])))
+            rows.append(
+                ("Buy & hold", f"{_fmt_pct(m['buy_hold_return'])} (même période, frais inclus)")
+            )
+        guard = self.guard_rails_text()
+        if guard:
+            rows.append(("Garde-fous", guard))
         width = max(len(label) for label, _ in rows)
         lines = [f"=== Résumé du backtest : {self.strategy_name} ==="]
         lines.extend(f"{label.ljust(width)} : {value}" for label, value in rows)
@@ -252,6 +309,20 @@ def _minimal_ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if out[["open", "high", "low", "close"]].isna().to_numpy().any():
         raise ValueError("Les prix OHLC contiennent des valeurs manquantes")
     return out
+
+
+def _median_bar_delta(index: pd.Index) -> pd.Timedelta | None:
+    """Durée médiane d'une bougie (None si moins de deux horodatages)."""
+    if len(index) < 2:
+        return None
+    try:
+        diffs = pd.Series(pd.DatetimeIndex(index)).diff().dropna()
+    except (TypeError, ValueError, AttributeError):
+        return None
+    diffs = diffs[diffs > pd.Timedelta(0)]
+    if diffs.empty:
+        return None
+    return pd.Timedelta(diffs.median())
 
 
 def _fallback_periods_per_year(index: pd.Index) -> float:
@@ -341,6 +412,11 @@ def _check_config(config: BacktestConfig) -> None:
         raise ValueError("initial_cash doit être strictement positif")
     if config.fee_rate < 0 or config.slippage < 0:
         raise ValueError("fee_rate et slippage doivent être positifs ou nuls")
+    if config.reentry_after_stop not in REENTRY_POLICIES:
+        raise ValueError(
+            f"reentry_after_stop={config.reentry_after_stop!r} invalide : valeurs possibles "
+            + ", ".join(repr(p) for p in REENTRY_POLICIES)
+        )
 
 
 def _empty_trades() -> pd.DataFrame:
@@ -405,6 +481,22 @@ def run_backtest(
     allow_short = bool(cfg.allow_short) and bool(getattr(risk_cfg, "allow_short", False))
     min_notional = float(getattr(risk_cfg, "min_trade_notional", 0.0) or 0.0)
     vol_target = getattr(risk_cfg, "vol_target", None)
+    protective_stop = getattr(rm, "protective_stop", None)
+    if not callable(protective_stop):  # gestionnaire « duck-typé » sans cette méthode
+        protective_stop = RiskManager(RiskConfig()).protective_stop
+    wait_after_exit = cfg.reentry_after_stop == "wait"
+
+    # Limite journalière : seulement en intrajournalier (règle 5).
+    bar_delta = _median_bar_delta(data.index)
+    daily_limit_active = not (bar_delta is not None and bar_delta >= pd.Timedelta(days=1))
+    setter = getattr(rm, "set_daily_limit_active", None)
+    if callable(setter):
+        setter(daily_limit_active, "" if daily_limit_active else "bougies >= 1 jour")
+    if not daily_limit_active and getattr(risk_cfg, "daily_loss_limit", None):
+        logger.info(
+            "limite de perte journalière désactivée : bougies >= 1 jour (bougie médiane %s)",
+            bar_delta,
+        )
 
     stop_pct = _pct_or_none(cfg.stop_loss_pct, "stop_loss_pct")
     take_pct = _pct_or_none(cfg.take_profit_pct, "take_profit_pct")
@@ -424,6 +516,8 @@ def run_backtest(
     timestamps = list(index.to_pydatetime())
     ppy = _periods_per_year(index)
     vols = _realized_vol(close_arr, ppy) if vol_target else None
+    # ATR(14) du stop de secours ; atr_arr[t-1] n'utilise que les bougies <= t-1.
+    atr_arr = ind.atr(data, DEFAULT_STOP_ATR_WINDOW).to_numpy(dtype=np.float64).tolist()
 
     equity = [0.0] * n
     positions = [0] * n
@@ -444,9 +538,14 @@ def run_backtest(
     pending_reason = "signal"
     prev_equity = cash
     n_refused_log = 0
+    blocked_side = 0  # côté bloqué après une sortie moteur (politique "wait")
+    events: list[dict[str, Any]] = []
+    kill_switch_seen = False
+    last_daily_event_day = None
+    n_daily_hits = 0
 
     def _close(exit_raw: float, t: int, reason: str) -> None:
-        nonlocal cash, pos, size, trade_fees, stop, take, extreme
+        nonlocal cash, pos, size, trade_fees, stop, take, extreme, blocked_side
         exit_exec = exit_raw * (1.0 - slip) if pos == 1 else exit_raw * (1.0 + slip)
         fee = size * exit_exec * fee_rate
         cash += pos * size * exit_exec - fee
@@ -468,6 +567,8 @@ def run_backtest(
                 exit_reason=reason,
             )
         )
+        if wait_after_exit and reason in ENGINE_EXIT_REASONS:
+            blocked_side = pos
         pos = 0
         size = 0.0
         trade_fees = 0.0
@@ -487,16 +588,19 @@ def run_backtest(
                 side = next_pos
                 exec_price = op * (1.0 + slip) if side == 1 else op * (1.0 - slip)
                 strat_stop = sl[t - 1] if t > 0 else nan
-                if strat_stop == strat_stop:  # stop fourni par la stratégie
-                    stop_price: float | None = strat_stop
-                elif stop_pct is not None:
-                    stop_price = exec_price * (1.0 - side * stop_pct)
-                else:
-                    stop_price = None
+                atr_prev = atr_arr[t - 1] if t > 0 else nan
                 realized = vols[t - 1] if (vols is not None and t > 0) else None
                 if realized is not None and realized != realized:
                     realized = None
-                qty = float(rm.position_size(prev_equity, exec_price, stop_price, realized))
+                if exec_price > 0 and math.isfinite(exec_price):
+                    # Jamais d'entrée sans stop (règle 3) : le sizing est toujours risk-based.
+                    stop_price = float(
+                        protective_stop(side, exec_price, strat_stop, atr_prev, stop_pct)
+                    )
+                    qty = float(rm.position_size(prev_equity, exec_price, stop_price, realized))
+                else:
+                    stop_price = nan
+                    qty = 0.0
                 if side == 1 and qty > 0:
                     affordable = cash / (exec_price * (1.0 + fee_rate))
                     if qty > affordable:
@@ -512,7 +616,7 @@ def run_backtest(
                     entry_idx = t
                     trade_fees = fee
                     bars_held = 0
-                    stop = stop_price if stop_price is not None else nan
+                    stop = stop_price
                     strat_take = tp[t - 1] if t > 0 else nan
                     if strat_take == strat_take:
                         take = strat_take
@@ -546,28 +650,28 @@ def run_backtest(
             bars_held += 1
             reason: str | None = None
             exit_raw = 0.0
+            has_stop = stop == stop
+            has_take = take == take
+            # Gaps d'ouverture d'abord (l'ouverture est le premier prix connu), puis
+            # touches intrabar, stop avant take-profit (pessimiste).
             if pos == 1:
-                if stop == stop:
-                    if op <= stop:
-                        exit_raw, reason = op, "stop_loss"
-                    elif lo <= stop:
-                        exit_raw, reason = stop, "stop_loss"
-                if reason is None and take == take:
-                    if op >= take:
-                        exit_raw, reason = op, "take_profit"
-                    elif hi >= take:
-                        exit_raw, reason = take, "take_profit"
+                if has_stop and op <= stop:
+                    exit_raw, reason = op, "stop_loss"
+                elif has_take and op >= take:
+                    exit_raw, reason = op, "take_profit"
+                elif has_stop and lo <= stop:
+                    exit_raw, reason = stop, "stop_loss"
+                elif has_take and hi >= take:
+                    exit_raw, reason = take, "take_profit"
             else:
-                if stop == stop:
-                    if op >= stop:
-                        exit_raw, reason = op, "stop_loss"
-                    elif hi >= stop:
-                        exit_raw, reason = stop, "stop_loss"
-                if reason is None and take == take:
-                    if op <= take:
-                        exit_raw, reason = op, "take_profit"
-                    elif lo <= take:
-                        exit_raw, reason = take, "take_profit"
+                if has_stop and op >= stop:
+                    exit_raw, reason = op, "stop_loss"
+                elif has_take and op <= take:
+                    exit_raw, reason = op, "take_profit"
+                elif has_stop and hi >= stop:
+                    exit_raw, reason = stop, "stop_loss"
+                elif has_take and lo <= take:
+                    exit_raw, reason = take, "take_profit"
             if reason is not None:
                 _close(exit_raw, t, reason)
 
@@ -586,11 +690,23 @@ def run_backtest(
             desired = sig[t]
             if desired == -1 and not allow_short:
                 desired = 0
+        if blocked_side != 0:
+            if sig[t] != blocked_side:
+                blocked_side = 0  # le signal brut a quitté ce côté : ré-entrée possible
+            elif desired == blocked_side:
+                desired = 0
         reason_next = "signal"
         if rm.kill_switch_active():
+            if not kill_switch_seen:
+                kill_switch_seen = True
+                events.append(_guard_event("kill_switch", ts, eq, rm, risk_cfg))
             desired = 0
             reason_next = "kill_switch"
         elif (pos != 0 or desired != 0) and rm.daily_limit_hit(ts, eq):
+            if ts.date() != last_daily_event_day:
+                last_daily_event_day = ts.date()
+                n_daily_hits += 1
+                events.append(_guard_event("daily_limit", ts, eq, rm, risk_cfg))
             desired = 0
             reason_next = "daily_limit"
         elif desired != 0 and desired != pos:
@@ -601,10 +717,12 @@ def run_backtest(
         next_pos = desired
         pending_reason = reason_next
 
-        # 6. mise à jour des niveaux actifs (stratégie puis stop suiveur)
+        # 6. mise à jour des niveaux actifs (stratégie puis stop suiveur). Un stop de
+        #    stratégie du mauvais côté de la clôture (ex. stop d'entrée porté par la
+        #    stratégie alors que le moteur a dû le remplacer) n'est pas un stop : ignoré.
         if pos != 0:
             s_t = sl[t]
-            if s_t == s_t:
+            if s_t == s_t and ((pos == 1 and s_t < cl) or (pos == -1 and s_t > cl)):
                 stop = s_t
             k_t = tp[t]
             if k_t == k_t:
@@ -635,13 +753,18 @@ def run_backtest(
     returns_s.name = "returns"
     positions_s = pd.Series(positions, index=index, name="position", dtype=np.int64)
     trades_df = _trades_frame(trades)
+    # Buy & hold de référence sur la période réellement tradable, frais inclus (règle 9).
+    first_tradable = min(warmup + 1, n - 1) if warmup > 0 else 0
     metrics = metrics_mod.compute_metrics(
         equity_s,
         trades_df,
         ppy,
-        benchmark=data["close"],
+        benchmark=data["close"].iloc[first_tradable:],
         positions=positions_s,
     )
+    metrics["buy_hold_return"] = _buy_hold_return(o[first_tradable], c[n - 1], fee_rate, slip)
+    metrics["kill_switch_triggered"] = int(kill_switch_seen)
+    metrics["n_daily_limit_hits"] = int(n_daily_hits)
     strategy_name = str(getattr(strategy, "name", type(strategy).__name__))
     params = dict(getattr(strategy, "params", {}) or {})
     logger.info(
@@ -663,4 +786,48 @@ def run_backtest(
         metrics=metrics,
         signals=signals,
         periods_per_year=ppy,
+        events=events,
+        warmup_bars=warmup,
+        daily_limit_active=daily_limit_active,
     )
+
+
+def _buy_hold_return(entry_open: float, last_close: float, fee_rate: float, slip: float) -> float:
+    """Rendement d'un achat à ``entry_open`` revendu à ``last_close``, net d'un aller-retour
+    de frais et de slippage (``(1+slip)(1+fee)`` à l'achat, ``(1-slip)(1-fee)`` à la vente)."""
+    cost = entry_open * (1.0 + slip) * (1.0 + fee_rate)
+    if not (cost > 0) or not math.isfinite(cost) or not math.isfinite(last_close):
+        return 0.0
+    return float(last_close * (1.0 - slip) * (1.0 - fee_rate) / cost - 1.0)
+
+
+def _guard_event(kind: str, ts: Any, equity: float, rm: Any, risk_cfg: Any) -> dict[str, Any]:
+    """Événement de garde-fou (JSON-safe) pour ``BacktestResult.events``."""
+    drawdown = 0.0
+    try:
+        drawdown = float(rm.drawdown())
+    except Exception:  # noqa: BLE001 - gestionnaire duck-typé
+        drawdown = 0.0
+    if kind == "kill_switch":
+        max_dd = getattr(risk_cfg, "max_drawdown", None) or 0.0
+        detail = (
+            f"drawdown {drawdown * 100:.1f} % > {max_dd * 100:.0f} % : position fermée à "
+            "l'ouverture suivante, plus aucune ouverture jusqu'à la fin du backtest"
+        )
+    else:
+        limit = getattr(risk_cfg, "daily_loss_limit", None) or 0.0
+        day_start = getattr(rm, "day_start_equity", None)
+        loss = 0.0
+        if day_start is not None and day_start > 0:
+            loss = max(0.0, 1.0 - float(equity) / float(day_start))
+        detail = (
+            f"perte journalière {loss * 100:.1f} % > {limit * 100:.0f} % : position fermée à "
+            "l'ouverture suivante, plus d'ouverture jusqu'au jour UTC suivant"
+        )
+    return {
+        "timestamp": ts.isoformat(),
+        "type": kind,
+        "equity": float(equity),
+        "drawdown": drawdown,
+        "detail": detail,
+    }
