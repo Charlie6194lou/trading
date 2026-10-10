@@ -25,7 +25,8 @@ class Order:
     price: float  # prix moyen d'exécution
     fee: float  # frais payés, en devise de cotation
     timestamp: datetime
-    status: str = "filled"  # "filled", "rejected", "open"
+    # "filled", "partial" (annulé par l'exchange après exécution partielle), "rejected", "open"
+    status: str = "filled"
     info: dict = field(default_factory=dict)
 
     @property

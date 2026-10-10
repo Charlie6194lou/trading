@@ -87,7 +87,7 @@ EXIT_REASONS: tuple[str, ...] = (
     "kill_switch",
     "daily_limit",
 )
-#: politiques de ré-entrée après une sortie décidée par le moteur (cf. règle 4)
+#: politiques de ré-entrée après une sortie décidée par le moteur (cf. règle 2)
 REENTRY_POLICIES: tuple[str, ...] = ("wait", "immediate")
 #: sorties décidées par le moteur qui bloquent la ré-entrée du même côté (politique "wait")
 ENGINE_EXIT_REASONS: frozenset[str] = frozenset({"stop_loss", "take_profit", "daily_limit"})
@@ -753,7 +753,7 @@ def run_backtest(
     returns_s.name = "returns"
     positions_s = pd.Series(positions, index=index, name="position", dtype=np.int64)
     trades_df = _trades_frame(trades)
-    # Buy & hold de référence sur la période réellement tradable, frais inclus (règle 9).
+    # Buy & hold de référence sur la période réellement tradable, frais inclus (règle 8).
     first_tradable = min(warmup + 1, n - 1) if warmup > 0 else 0
     metrics = metrics_mod.compute_metrics(
         equity_s,

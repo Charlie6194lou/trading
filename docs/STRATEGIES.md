@@ -20,7 +20,14 @@ Pour en tester une sur des données fictives, sans réseau : `tradingbot demo`.
   n'utilise jamais une information qu'il n'avait pas encore (pas de « triche » sur le futur).
 - **Stop (stop-loss)** : prix auquel on coupe la position si le marché va contre nous.
   C'est la ceinture de sécurité : il limite la perte d'un trade. Toutes les stratégies
-  fournissent un stop basé sur l'**ATR**.
+  livrées fournissent un stop basé sur l'**ATR**, et le portent sur **chaque bougie** où
+  elles sont en position (pas seulement à l'entrée) : un robot qui démarre en cours de
+  tendance a donc toujours le stop de la stratégie. Si une stratégie n'en donnait pas (ou
+  le donnait du mauvais côté du prix), le robot placerait lui-même un stop de secours
+  (voir *Points communs*) : **aucune position ne s'ouvre sans stop**.
+- **Range (marché sans tendance)** : le prix oscille entre un plancher et un plafond sans
+  direction durable ; on dit aussi « marché en sur-place » ou « latéral ». C'est le régime
+  où les stratégies de tendance perdent et où `bollinger_reversion` gagne.
 - **ATR (Average True Range)** : la taille moyenne des mouvements d'une bougie, c'est-à-dire
   « combien le prix bouge d'habitude ». Un stop à `3 × ATR` est placé à trois mouvements
   habituels du prix : assez loin pour ne pas être touché par le bruit, assez près pour
@@ -40,7 +47,8 @@ Pour en tester une sur des données fictives, sans réseau : `tradingbot demo`.
 | Famille | Stratégies | Parie sur | Gagne quand | Perd quand |
 |---|---|---|---|---|
 | Suivi de tendance | `sma_cross`, `ema_trend`, `donchian_breakout` | la continuation du mouvement | le marché part dans une direction durable | le marché fait du sur-place (faux départs à répétition) |
-| Retour à la moyenne | `rsi_reversion`, `bollinger_reversion` | le rebond après un excès | le marché oscille autour d'un niveau | le marché s'effondre sans rebondir (« attraper un couteau qui tombe ») |
+| Retour à la moyenne | `bollinger_reversion` | le rebond après un excès | le marché oscille autour d'un niveau (range) | le marché s'effondre sans rebondir (« attraper un couteau qui tombe ») |
+| Retour à la moyenne **filtré par la tendance** | `rsi_reversion` | le rebond d'un repli **dans un marché haussier** | le marché monte avec des corrections régulières (« acheter les creux ») | le marché s'effondre (le filtre réagit en retard) ; dans un range pur elle ne trade presque pas (voir sa section) |
 
 Les stratégies de tendance ont typiquement un faible taux de réussite (30-45 % de trades
 gagnants) mais des gains moyens bien plus grands que les pertes. Les stratégies de
@@ -62,12 +70,16 @@ haussière s'installe. On suit le mouvement.
 - Il n'y a donc jamais de « sortie à plat » : on est toujours d'un côté ou de l'autre.
   C'est la plus simple des stratégies, et la plus exposée aux faux signaux.
 
-**Stop.** Sur la bougie d'entrée : `close − atr_mult × ATR` (pour un long).
-Le stop n'est pas déplacé ensuite ; la sortie normale est le croisement inverse.
+**Stop.** Calculé sur la bougie d'entrée : `close − atr_mult × ATR` (pour un long), puis
+**porté tel quel sur chaque bougie** tant que la position est tenue (il n'est pas déplacé) ;
+la sortie normale est le croisement inverse. Si le stop est touché, le moteur / le robot
+ferment la position et n'en rouvrent pas une du même côté tant que les moyennes ne se sont
+pas recroisées (politique `wait`, voir *Points communs*).
 
 **Marché favorable / défavorable.** Excellente dans une tendance longue et propre (par
-exemple un marché haussier de plusieurs mois). Mauvaise dans un marché en range : les
-moyennes se croisent sans cesse et chaque croisement coûte des frais et une petite perte.
+exemple un marché haussier de plusieurs mois). Mauvaise dans un marché en range (sans
+tendance) : les moyennes se croisent sans cesse et chaque croisement coûte des frais et une
+petite perte.
 
 | Paramètre | Défaut | Signification |
 |---|---|---|
@@ -94,8 +106,12 @@ moyennes se croisent sans cesse et chaque croisement coûte des frais et une pet
 - **Sortie** si l'une des deux conditions se produit :
   - les EMA se recroisent (la tendance s'inverse). Si l'ADX est au-dessus du seuil à ce
     moment-là, on se retourne directement dans l'autre sens ;
-  - la clôture passe sous le stop suiveur. On reste plat une bougie, puis on réévalue :
-    si la tendance et l'ADX le justifient, on rentre avec un nouveau stop.
+  - le **plus bas** de la bougie touche le stop suiveur (`low <= stop` ; `high >= stop` pour
+    un short), c'est-à-dire exactement la condition à laquelle le moteur de backtest et le
+    robot exécutent ce stop. On reste plat une bougie, puis on réévalue : si la tendance et
+    l'ADX le justifient, on rentre avec un nouveau stop. La stratégie et le moteur voient
+    ainsi la **même** sortie : il n'y a plus de ré-entrée immédiate avec un stop déjà
+    touché, qui faisait autrefois enchaîner les stop-outs.
 - **Choix de conception** : l'ADX ne sert qu'à l'*entrée*. Une position ouverte est
   conservée tant que les EMA restent dans le bon ordre, même si l'ADX redescend sous le
   seuil. Une tendance qui ralentit n'est pas une tendance qui s'inverse ; sortir à chaque
@@ -103,7 +119,8 @@ moyennes se croisent sans cesse et chaque croisement coûte des frais et une pet
 
 **Stop.** À l'entrée : `close − atr_mult × ATR`. Ensuite, à chaque bougie en position,
 le stop vaut `max(stop précédent, close − atr_mult × ATR)` (symétrique pour un short).
-Le moteur met à jour son stop à chaque bougie.
+Le moteur met à jour son stop à chaque bougie (un stop qui serait passé du mauvais côté du
+prix est ignoré).
 
 **Marché favorable / défavorable.** Marchés en tendance nette (ADX > 25). Moins de
 faux signaux que `sma_cross` dans les ranges, mais entre plus tard dans la tendance (le
@@ -135,14 +152,22 @@ marché qui s'effondre.
   `max_hold` bougies (le rebond n'est pas venu : on ne s'entête pas).
 - Jamais de vente à découvert.
 
-**Stop.** À l'entrée : `close − atr_mult × ATR` (plus serré que pour les stratégies de
-tendance : un rebond qui ne vient pas se reconnaît vite).
+**Stop.** Calculé à l'entrée : `close − atr_mult × ATR` (plus serré que pour les stratégies
+de tendance : un rebond qui ne vient pas se reconnaît vite), puis porté tel quel sur chaque
+bougie en position.
 
 **Marché favorable / défavorable.** Marché haussier avec des corrections régulières
 (« acheter les creux »). Mauvaise quand la tendance de fond casse : les premiers replis
 après un sommet ressemblent à des creux à acheter, et le filtre de tendance ne réagit
 qu'avec retard. Dans un marché sans replis (hausse rectiligne), elle ne fait tout
-simplement rien.
+simplement rien. **Dans un range pur non plus**, et c'est voulu : quand le prix oscille
+autour d'un niveau, le RSI passe sous 30 précisément quand la clôture est nettement *sous*
+la moyenne à 200 bougies, donc le filtre `close > SMA(trend_window)` rejette presque toutes
+les entrées (0 à 2 trades sur 3 000 bougies dans nos essais, là où `bollinger_reversion`
+en fait 30 à 40). Si `demo` ou `compare` lui attribuent très peu de trades, elle n'est pas
+cassée : c'est son filtre qui la tient à l'écart. Pour un marché en range, utilisez
+`bollinger_reversion` ; abaisser `trend_window` ne suffit pas (le mécanisme est le même avec
+une moyenne à 50).
 
 | Paramètre | Défaut | Signification |
 |---|---|---|
@@ -172,10 +197,11 @@ l'expérience des « Turtle Traders » dans les années 1980.
 - Les canaux sont calculés sur les bougies *précédentes* : la bougie courante ne peut pas
   déclencher sa propre cassure.
 
-**Stop.** À l'entrée : `close − atr_mult × ATR` (pour un long).
+**Stop.** Calculé à l'entrée : `close − atr_mult × ATR` (pour un long), puis porté tel quel
+sur chaque bougie en position.
 
 **Marché favorable / défavorable.** Marchés qui font de longs mouvements directionnels
-(les cryptos en ont souvent). Très mauvaise dans un range étroit : chaque sortie du
+(les cryptos en ont souvent). Très mauvaise dans un range (sans tendance) étroit : chaque sortie du
 canal est un faux départ, et la sortie sur le plus bas à 10 bougies arrive après une
 perte. Attendez-vous à beaucoup de petits trades perdants compensés par quelques gros
 gagnants ; c'est normal pour cette stratégie, mais psychologiquement difficile.
@@ -199,10 +225,14 @@ on achète en pariant sur un retour vers la moyenne.
 **Entrée / sortie.**
 - **Entrée** (si plat) : `close < bande basse` **et** `RSI < rsi_max`.
 - **Sortie** : `close >= bande du milieu` (la moyenne a été rejointe).
-- Jamais de vente à découvert. Pas de limite de durée : seul le stop coupe un trade qui
-  tourne mal.
+- Jamais de vente à découvert. Pas de limite de durée : seul le stop (ou un garde-fou du
+  gestionnaire de risque : kill switch, limite journalière) coupe un trade qui tourne mal.
 
-**Stop.** À l'entrée : `close − atr_mult × ATR`.
+**Stop.** Calculé à l'entrée : `close − atr_mult × ATR`, puis porté tel quel sur chaque
+bougie en position. Après un stop touché, la stratégie peut encore dire « achète » à la
+bougie suivante si le prix reste sous la bande basse ; le robot attend qu'elle soit repassée
+à plat avant de racheter (politique `wait`) : dans un krach, cela évite d'enchaîner les
+stop-outs à chaque bougie.
 
 **Marché favorable / défavorable.** Marchés qui oscillent (range, consolidation). Dans
 un krach, le prix peut *rester* sous la bande basse pendant des jours : la stratégie
@@ -228,6 +258,25 @@ cas, pas totalement.
   bougies ou toute la série.
 - **Signaux stables.** Une position est conservée jusqu'à une condition de sortie
   explicite ; aucune stratégie ne bascule entre 1 et 0 à chaque bougie sur du bruit.
+- **Un stop à chaque bougie en position.** Chaque stratégie exporte son `stop_loss` sur
+  **toutes** les bougies où son signal n'est pas nul (stop d'entrée constant pour
+  `sma_cross`, `donchian_breakout`, `rsi_reversion`, `bollinger_reversion` ; stop suiveur pour
+  `ema_trend`). Un moteur ou un robot qui entre en cours de position dispose donc toujours
+  du stop de la stratégie.
+- **Jamais d'entrée sans stop, taille basée sur le risque.** Avant chaque entrée, le
+  gestionnaire de risque choisit le stop dans cet ordre : (1) le stop de la stratégie s'il
+  est du bon côté du prix d'exécution ; (2) `stop_loss_pct` s'il est configuré dans le
+  moteur de backtest ; (3) un stop de secours à `default_stop_atr_mult × ATR(14)` (3 × ATR
+  par défaut) ; (4) un stop de dernier recours à `default_stop_pct` (5 %) du prix, avec un
+  avertissement. La taille de la position vaut `capital × risk_per_trade ÷ distance au
+  stop`, plafonnée par `max_position_fraction`.
+- **Ré-entrée après une sortie forcée (`wait`).** Après un stop, un objectif atteint ou la
+  limite de perte journalière, le moteur et le robot n'ouvrent pas à nouveau du même côté
+  tant que le signal brut de la stratégie n'est pas repassé par 0 (ou ne s'est pas retourné)
+  sur une bougie ultérieure. `sma_cross` est le cas le plus visible : son signal reste `1`
+  tant que la moyenne courte est au-dessus de la longue, donc après un stop elle ne rentre
+  qu'au prochain croisement. L'ancien comportement (racheter dès la bougie suivante) reste
+  disponible avec `reentry_after_stop = "immediate"` dans le moteur de backtest.
 - **Période de chauffe.** `warmup_bars()` = plus longue fenêtre utilisée + une marge
   (doublée pour les EMA et l'ADX, qui convergent lentement). Avant cela, signal `0`.
 - **Paramètres.** `--param nom=valeur` en ligne de commande, ou `[strategy.params]` dans
@@ -270,7 +319,9 @@ Comment s'en protéger (ce que fait `tradingbot optimize`) :
 - **Walk-forward** : on optimise sur une période (*in-sample*), puis on vérifie sur la
   période **suivante** jamais vue (*out-of-sample*), et on avance. Seul le résultat
   out-of-sample compte. Si la performance in-sample est bien meilleure que l'out-of-sample
-  (`overfit_ratio` élevé), méfiez-vous.
+  (ratio OOS / IS **très inférieur à 1**, nul ou négatif), méfiez-vous : un ratio proche de
+  1 est robuste, un ratio bas signe le sur-apprentissage (même lecture dans le README, le
+  guide du débutant et le compte rendu de `optimize`).
 - **Peu de paramètres, petites grilles**, valeurs « rondes » : si la stratégie ne marche
   qu'avec `slow = 63` et pas avec `50` ou `100`, elle ne marche pas.
 - **Se méfier de tout ce qui est trop beau** : un Sharpe > 3 ou une courbe d'équité sans

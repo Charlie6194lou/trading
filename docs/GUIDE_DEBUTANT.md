@@ -54,8 +54,11 @@ s'appelle « pas de *look-ahead* » et elle vaut en simulation comme en réel.
 
 Une stratégie est une **règle** qui, à la clôture de chaque bougie, répond à une seule
 question : *quelle position veux-je tenir pendant la prochaine bougie ?* Long (`1`),
-plat (`0`) ou short (`-1`). Elle ajoute éventuellement un **stop** : le prix auquel couper
-la position si le marché part dans le mauvais sens.
+plat (`0`) ou short (`-1`). Elle ajoute un **stop** : le prix auquel couper la position si
+le marché part dans le mauvais sens. Les cinq stratégies livrées le fournissent sur
+**chaque bougie** où elles sont en position (pas seulement à l'entrée), et si une stratégie
+n'en donnait pas, le robot en placerait un lui-même (voir §3) : **aucune position ne s'ouvre
+sans stop**.
 
 Les cinq stratégies livrées se rangent en deux familles :
 
@@ -100,18 +103,45 @@ beaucoup plus pour revenir à zéro ; le second a perdu environ 5 %.
 C'est la raison d'être du **gestionnaire de risque** du robot (`[risk]` dans
 `config.toml`) :
 
-1. **`risk_per_trade` (1 %)** : la taille de la position est calculée pour qu'un stop touché
-   coûte 1 % du capital. Stop loin → petite position ; stop proche → position plus grande
-   (plafonnée).
-2. **`max_position_fraction` (95 %)** : jamais plus de 95 % du capital engagé, quoi qu'il
-   arrive.
-3. **`max_drawdown` (20 %)** : le **kill switch**. Si le capital a perdu 20 % depuis son plus
-   haut, le robot ferme tout et refuse d'ouvrir quoi que ce soit jusqu'à ce que *vous*
-   remettiez le compteur à zéro (en supprimant `state/<mode>/<...>/risk.json` après
-   réflexion).
-4. **`daily_loss_limit` (5 %)** : à –5 % sur la journée (UTC), le robot ferme tout et attend
-   le lendemain.
-5. **`min_trade_notional`** : pas d'ordre ridiculement petit (les frais le mangeraient).
+1. **Un stop, toujours.** Avant d'ouvrir, le robot choisit le stop dans cet ordre : le stop
+   de la **stratégie** s'il est du bon côté du prix (sous le prix pour un achat) ; sinon un
+   **stop de secours** à `default_stop_atr_mult` (3) fois l'ATR des 14 dernières bougies,
+   c'est-à-dire à trois « mouvements habituels » du prix ; sinon, si l'ATR n'est pas
+   calculable (trop peu de bougies), un stop de **dernier recours** à `default_stop_pct`
+   (5 %) du prix, avec un avertissement dans le journal. En pratique, les cinq stratégies
+   livrées donnent leur stop à chaque bougie et c'est presque toujours lui qui sert ; le
+   stop de secours est un filet, pas la règle.
+2. **`risk_per_trade` (1 %)** : la taille de la position est calculée pour qu'un stop touché
+   coûte 1 % du capital : `taille = capital × 1 % ÷ distance au stop`. Stop loin → petite
+   position ; stop proche → position plus grande (plafonnée, voir le point suivant).
+3. **`max_position_fraction` (95 %)** : jamais plus de 95 % du capital engagé, quoi qu'il
+   arrive, et jamais de levier. **Cas fréquent à comprendre** : sur un actif peu volatil
+   (une paire de devises en bougies horaires, par exemple), le stop à 3 × ATR est tout près
+   du prix (0,3 %) ; la règle du 1 % demanderait alors d'acheter pour trois fois le capital.
+   Le plafond s'applique : la position vaut ~95 % du compte, et le risque réellement couru
+   si le stop est touché n'est que de `0,3 % × 95 % ≈ 0,3 %` du capital, **moins** que le 1 %
+   visé. Le risque par trade est donc plus petit que prévu, mais presque tout le compte est
+   engagé (au comptant, sans levier : la perte reste bornée par le stop). Si cela vous gêne,
+   baissez `max_position_fraction`.
+4. **`max_drawdown` (20 %)** : le **kill switch**. Si le capital a perdu 20 % depuis son plus
+   haut, le robot ferme la position, refuse d'ouvrir quoi que ce soit et arrête la boucle,
+   jusqu'à ce que *vous* remettiez le compteur à zéro (en supprimant
+   `state/<mode>/<...>/risk.json` après réflexion). En paper / live, il est évalué à **chaque
+   interrogation du marché** (toutes les `durée de bougie / 12`), pas seulement à la
+   clôture d'une bougie ; en backtest, à chaque bougie. Entre deux interrogations, rien
+   n'est surveillé : c'est une borne, pas une garantie.
+5. **`daily_loss_limit` (5 %)** : à –5 % depuis le capital de début de journée (UTC), le
+   robot ferme tout et attend le lendemain. Elle n'a de sens qu'en **intrajournalier** : sur
+   des bougies d'un jour ou plus, chaque bougie est une nouvelle journée et une seule bougie
+   à –5 % la déclencherait à tort ; elle est alors automatiquement **inactive** (le rapport
+   et le récapitulatif l'indiquent ; le kill switch, lui, reste actif).
+6. **Ré-entrée après une sortie forcée** (`wait`, politique par défaut) : après un stop, un
+   objectif ou la limite journalière, le robot n'achète pas à nouveau dès la bougie suivante
+   sous prétexte que la stratégie dit encore « long » ; il attend que le signal soit repassé
+   par plat (ou se soit retourné) avant de rentrer du même côté. Sans cela, dans un marché
+   qui baisse par paliers, on serait stoppé, racheté, stoppé, racheté… en payant des frais à
+   chaque fois.
+7. **`min_trade_notional`** : pas d'ordre ridiculement petit (les frais le mangeraient).
 
 Le tableau des pertes à rattraper est à méditer :
 
@@ -148,9 +178,10 @@ tradingbot backtest --strategy ema_trend --exchange binance --symbol BTC/USDT --
 
 ### En-tête
 
-Stratégie, paramètres, période, nombre de bougies, capital initial, coûts par ordre. Si
-la période fait moins d'un an ou moins de quelques centaines de bougies, tout ce qui suit
-est peu fiable.
+Stratégie, paramètres, période, nombre de bougies, capital initial, coûts par ordre, puis
+deux lignes sur les règles du moteur : **Stop de protection** (toujours présent, voir §3) et
+**Ré-entrée après stop** (`wait`). Si la période fait moins d'un an ou moins de quelques
+centaines de bougies, tout ce qui suit est peu fiable.
 
 ### Performance
 
@@ -197,19 +228,36 @@ est peu fiable.
 
 ### Comparaison avec le buy & hold
 
-Le **buy & hold** (acheter au début, ne rien faire) est l'adversaire à battre. Beaucoup
-de stratégies perdent contre lui dans un marché haussier, tout en ayant un drawdown plus
-faible. C'est un vrai arbitrage : moins gagner, mais moins souffrir. À vous de voir ce
+Le **buy & hold** (acheter au début, ne rien faire) est l'adversaire à battre. Pour que la
+comparaison soit équitable, il est mesuré **sur la même période tradable** que la stratégie
+(achat à la première bougie après sa période de chauffe, revente à la dernière clôture) et
+**frais et glissement inclus**, comme un trade ; le rapport le rappelle sous la comparaison.
+Beaucoup de stratégies perdent contre lui dans un marché haussier, tout en ayant un drawdown
+plus faible. C'est un vrai arbitrage : moins gagner, mais moins souffrir. À vous de voir ce
 que vous recherchez ; mais une stratégie qui fait moins bien **et** souffre plus est à
 jeter.
+
+### Garde-fous déclenchés
+
+Cette section dit, en une phrase par événement, si le kill switch ou la limite de perte
+journalière sont intervenus : « Kill switch le 2021-05-19 04:00 (capital 802.00) : le robot
+a cessé de trader le 2021-05-19 04:00 après une baisse de 20.20 % depuis le sommet, et n'a
+plus rien ouvert jusqu'à la fin du backtest… ». C'est capital pour
+lire le reste : une stratégie arrêtée par le kill switch au tiers de la période affiche un
+rendement qui ne couvre que ce tiers ; les deux autres tiers, elle n'a rien fait. Dans le
+tableau de `compare`, ces stratégies portent la marque `⚠ arrêt`. Sur des bougies
+journalières ou plus longues, la section précise que la limite journalière était inactive
+(§3).
 
 ### Les pires et les meilleurs trades
 
 Regardez la colonne **Raison** des pires trades :
 
-- `stop` : le stop a fait son travail (la perte est restée bornée) ;
+- `stop` : le stop a fait son travail (la perte est restée bornée à ~`risk_per_trade`) ;
 - `signal` : la stratégie a changé d'avis en perte ;
-- `kill switch` / `limite journ.` : le gestionnaire de risque a coupé.
+- `objectif` : le take-profit a encaissé ;
+- `kill switch` / `limite journ.` : le gestionnaire de risque a coupé ;
+- `fin` : position fermée à la dernière bougie du backtest.
 
 Si les pires pertes dépassent largement `risk_per_trade`, c'est qu'un **gap** (le prix a
 sauté par-dessus le stop à l'ouverture d'une bougie) est passé par là : cela arrive, et
@@ -226,9 +274,13 @@ pressé, mais revenez aux chiffres.
 
 ### `compare`
 
-Un tableau, une ligne par stratégie, trié par Sharpe, plus la ligne buy & hold. Ne
-retenez pas « la première » : retenez celles qui combinent un Sharpe > 1, un drawdown que
-vous tolérez et un nombre de trades suffisant. Puis passez-les au walk-forward.
+Un tableau, une ligne par stratégie, trié par Sharpe, plus la ligne buy & hold (sur la
+période tradable commune à toutes, après la plus longue chauffe, frais inclus). Un nom
+suivi de `⚠ arrêt` a été stoppé par le kill switch en cours de route ; `⚠ limite journ. ×N`
+compte les jours bloqués par la limite journalière ; les notes sous le tableau l'expliquent.
+Ne retenez pas « la première » : retenez celles qui combinent un Sharpe > 1, un drawdown
+que vous tolérez, un nombre de trades suffisant et aucun `⚠`. Puis passez-les au
+walk-forward.
 
 ### `optimize` (walk-forward) : le détecteur de sur-apprentissage
 
@@ -244,12 +296,23 @@ OOS), avance, recommence. Dans le rapport :
   paramètres qui changent du tout au tout d'une fenêtre à l'autre sont un mauvais signe
   (la stratégie n'a pas de « bon » réglage stable) ;
 - **Équité OOS** : la courbe de ce que vous auriez vraiment vécu ;
-- **Moyenne IS / Moyenne OOS / Ratio OOS ÷ IS** : le ratio de sur-apprentissage.
+- **Moyenne IS / Moyenne OOS / Ratio OOS ÷ IS** : le ratio de sur-apprentissage (les
+  moyennes sont pondérées par le nombre de bougies de chaque fenêtre de test). Lecture, la
+  même partout dans le robot et ses documents : **bas = sur-apprentissage**.
   - proche de 1 (0,7 à 1,2) : robuste ;
-  - nettement inférieur (0,3) : les beaux chiffres étaient du bruit ;
+  - entre 0,5 et 0,7 : acceptable mais fragile (c'est le minimum de la liste de contrôle
+    du §8) ;
+  - nettement inférieur (0,3) : les beaux chiffres de l'entraînement étaient du bruit ;
   - nul ou négatif : la stratégie perd hors échantillon. Abandonnez ;
-  - `n/d` : la moyenne IS est négative ou nulle, le ratio n'a pas de sens — la stratégie ne
-    gagnait même pas sur les données d'entraînement.
+  - supérieur à 1 : mieux hors échantillon qu'en entraînement, rare, souvent le hasard ;
+  - `n/d` : moyenne IS nulle, infinie ou de signe opposé à la moyenne OOS — le ratio n'a
+    pas de sens (par exemple la stratégie ne gagnait même pas sur les données
+    d'entraînement). Pour une métrique négative comme `max_drawdown` (IS et OOS tous deux
+    négatifs), le ratio vaut |IS| / |OOS| et se lit de la même façon.
+- Le compte rendu signale aussi, après coup, si la courbe OOS enchaînée aurait déclenché le
+  **kill switch** en réel (« ⚠ En réel, le kill switch … aurait arrêté le robot le … ») et
+  rappelle que la position est fermée à la fin de chaque fenêtre de test (les fenêtres
+  courtes pénalisent les stratégies qui gardent longtemps leurs positions).
 
 Une règle simple : **ne mettez jamais en paper, et encore moins en réel, une stratégie
 dont la courbe OOS perd de l'argent ou dont le ratio est mauvais**, quel que soit son
@@ -274,18 +337,35 @@ backtest.
 Deux comportements à connaître :
 
 - **Idempotence** : relancer sur la même bougie donne `skip` / « bougie déjà traitée ».
-  L'état est mémorisé dans `state/paper/<exchange>_<symbole>_<timeframe>/` et le compte
-  fictif dans `state/paper_<exchange>_<symbole>.json`. Pour repartir de zéro, supprimez ces
-  fichiers.
+  Tout l'état d'une boucle est dans **un seul dossier**
+  `state/paper/<exchange>_<symbole>_<timeframe>/` : `last_bar.json`, `position.json` (côté,
+  taille, stop, objectif, côté bloqué par la politique de ré-entrée), `risk.json` et le compte
+  fictif `account.json`. Deux boucles sur le même symbole mais des timeframes différents ont
+  donc chacune leur compte. Pour repartir de zéro, supprimez ce dossier.
+- **Un seul robot par dossier** : le fichier `lock` du dossier est verrouillé par le robot
+  qui tourne. Une seconde commande `paper` (ou `live`) sur le même dossier s'arrête tout de
+  suite (« REFUS : le répertoire d'état … est déjà utilisé par un autre robot (PID …) »,
+  code de sortie 2) : impossible que deux processus se partagent un compte sans le savoir.
+- **Code de sortie de `--once`** : `0` si l'itération s'est bien passée (y compris `hold`,
+  `skip`, `refused`), `1` si elle s'est terminée en `error` (exchange injoignable, ordre
+  refusé) : utile dans un script.
 - **Démarrage au milieu d'une tendance** : si la stratégie est déjà « long » depuis
-  longtemps quand vous lancez le robot, il ouvre la position immédiatement. Avec
-  `ema_trend` (le défaut de `config.example.toml`), un stop suiveur est fourni à chaque
-  bougie, donc la position a un stop dès le départ. Avec les autres stratégies, le stop
-  n'est émis qu'à la bougie du croisement initial : une position ouverte en cours de route
-  peut n'avoir **aucun stop de stratégie** et être dimensionnée au plafond
-  (`max_position_fraction`). Le kill switch et la limite journalière restent actifs, mais
-  c'est une raison de plus de commencer en paper, et de préférer `ema_trend` pour le temps
-  réel.
+  longtemps quand vous lancez le robot, il ouvre la position immédiatement — **avec un
+  stop** et une taille basée sur le risque (§3) : toutes les stratégies livrées portent leur
+  stop sur chaque bougie où elles sont en position, et `ema_trend` (la stratégie par défaut
+  de `config.example.toml`) fournit même un stop suiveur qui monte avec le prix. Si une
+  stratégie ne donnait pas de stop, le stop de secours à 3 × ATR s'appliquerait. C'est quand
+  même une raison de commencer en paper : entrer tard dans une tendance, c'est souvent
+  entrer juste avant le repli.
+- **Position existante sur le compte** : si le compte détient déjà l'actif (achat manuel,
+  ancien robot) alors que `position.json` est vide, le robot **ne le vend pas**, ne le
+  protège pas et refuse d'ouvrir (`refused`, « position existante non gérée par le robot »)
+  tant qu'il est là ; le récapitulatif l'affiche sur la ligne « Position existante ».
+  Relancez avec `--adopt-position` pour lui confier cette position (sans stop jusqu'au
+  prochain stop de la stratégie), ou vendez-la à la main.
+- **Après un stop** : la stratégie peut dire encore « long » à la bougie suivante ; le robot
+  attend tout de même que le signal soit repassé par plat (politique `wait`, §3). La raison
+  « ré-entrée longue bloquée après une sortie forcée » dans le JSON est normale.
 
 ---
 
@@ -317,9 +397,11 @@ Ne cochez une case que si c'est vraiment vrai.
 **La stratégie**
 
 - [ ] Backtestée sur **au moins deux ans** de données, incluant un marché baissier.
-- [ ] Walk-forward : courbe OOS positive **et** ratio OOS/IS raisonnable (≥ 0,5 environ).
+- [ ] Walk-forward : courbe OOS positive **et** ratio OOS/IS raisonnable (≥ 0,5 environ,
+  proche de 1 de préférence ; voir §5) **et** aucun kill switch signalé dans le compte rendu.
 - [ ] Au moins 100 trades dans le backtest.
-- [ ] Le drawdown maximal du backtest est un chiffre que je **tolérerais** en réel.
+- [ ] Le drawdown maximal du backtest est un chiffre que je **tolérerais** en réel, et la
+  section « Garde-fous déclenchés » du rapport est vide (pas de kill switch).
 - [ ] Les frais totaux restent une petite fraction du gain.
 - [ ] Je comprends **pourquoi** elle gagne et **quand** elle perd (voir `STRATEGIES.md`).
 

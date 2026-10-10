@@ -29,7 +29,10 @@
   « appris par cœur » le passé) ou d'une erreur de programmation.
 
 C'est un **outil d'apprentissage** livré avec un réglage par défaut sûr : mode `paper`
-(argent fictif), pas de vente à découvert, pas de levier, 1 % du capital risqué par trade.
+(argent fictif), pas de vente à découvert, pas de levier, **toujours un stop** sur chaque
+position et 1 % du capital risqué par trade (la taille de la position est calculée à partir de
+la distance au stop ; sur un actif peu volatil, c'est le plafond de 95 % du capital qui borne la
+taille, et le risque effectif est alors *inférieur* à 1 %, voir le guide du débutant).
 
 ## 2. Les 5 règles d'or
 
@@ -38,7 +41,8 @@ C'est un **outil d'apprentissage** livré avec un réglage par défaut sûr : mo
 │ 1. N'investissez JAMAIS un argent dont la perte totale changerait votre vie.     │
 │ 2. Faites du paper trading (argent fictif) pendant des SEMAINES avant le réel.   │
 │ 3. Commencez petit : un montant que vous accepteriez de voir disparaître.        │
-│ 4. Toujours un stop (le robot en met un) et toujours un kill switch (activé).    │
+│ 4. Toujours un stop (le robot en met un, même si la stratégie n'en donne pas).  │
+│    Toujours un kill switch (activé par défaut).                                  │
 │ 5. Pas de levier, pas d'emprunt, pas de « rattrapage » après une perte.          │
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -76,9 +80,15 @@ tradingbot demo
 ```
 
 Génère 3 000 bougies horaires **synthétiques** (tirées au hasard), lance les cinq
-stratégies dessus et affiche un tableau comparatif. Le message en majuscules à la fin est
-important : ces données ne prouvent rien. La démo sert juste à vérifier que tout
-fonctionne.
+stratégies dessus et affiche un tableau comparatif. Le message d'avertissement à la fin
+(« ATTENTION : ces bougies sont SYNTHÉTIQUES… ») est important : ces données ne prouvent
+rien. La démo sert juste à vérifier que tout fonctionne.
+
+**Attendez-vous à du rouge.** Avec la graine par défaut (`--seed 42`), le marché synthétique
+perd environ 70 % sur la période : il est normal que toutes les stratégies affichent des
+rendements et des Sharpe négatifs. Seule la ligne « Buy & hold » sert de repère : une
+stratégie à –10 % quand le marché fait –70 % a *perdu moins*, elle n'a pas gagné. Essayez
+`tradingbot demo --seed 7` pour un autre régime de marché.
 
 ```
 Stratégie           | Rendement |   CAGR  | Sharpe |  Max DD  | Trades | Réussite
@@ -95,8 +105,13 @@ Buy & hold          |   ...     |   ...   |  ...   |   ...    |      1 |   –
   –25 % signifie qu'à un moment vous auriez vu un quart de votre argent disparaître.
   C'est le chiffre qui dit si vous *tiendrez* psychologiquement.
 - **Trades** et **Réussite** : nombre d'allers-retours et part des trades gagnants.
-- **Buy & hold** : ce qu'aurait donné un simple achat au début, conservé jusqu'à la fin.
-  Une stratégie qui ne fait pas mieux n'apporte rien.
+- **Buy & hold** : ce qu'aurait donné un simple achat au début, conservé jusqu'à la fin —
+  mesuré sur la **même période que les stratégies** (après leur période de chauffe, c'est-à-dire
+  à partir de la première bougie où elles pouvaient trader) et **frais et glissement inclus**,
+  comme un trade. Une stratégie qui ne fait pas mieux n'apporte rien.
+- Un nom suivi de **`⚠ arrêt`** signale que le kill switch a arrêté cette stratégie en cours de
+  route (son rendement s'arrête donc là) ; `⚠ limite journ. ×N` compte les jours où la limite
+  de perte journalière l'a bloquée. Une note sous le tableau l'explique.
 
 ### Étape 2 — `list-strategies` : les stratégies disponibles
 
@@ -116,10 +131,20 @@ tradingbot download --exchange binance --symbol BTC/USDT --timeframe 1h --since 
 Télécharge les bougies horaires de BTC/USDT depuis le 1er janvier 2023 (données publiques,
 aucune clé nécessaire) et les met en cache dans `data/cache/binance_BTC-USDT_1h.csv`. Les
 commandes suivantes réutiliseront ce cache. Options : `--out fichier.csv` pour une copie,
-`--refresh` pour retélécharger, `--until 2024-12-31` pour borner.
+`--refresh` pour tout retélécharger, `--until 2024-12-31` pour borner.
 
 Sans `--since`, l'exchange ne renvoie que les ~1 000 dernières bougies : trop peu pour un
 backtest sérieux. Visez **au moins deux ans** de données.
+
+**Le cache et `--since`.** Si un cache existe déjà (par exemple parce que vous avez lancé un
+`backtest` ou un `compare` avant cette étape, avec seulement ~1 000 bougies), il n'est pas
+ignoré : s'il **couvre** la période demandée, il est réutilisé tel quel et rien n'est
+téléchargé ; si `--since` est antérieur à sa première bougie (ou `--until` postérieur à la
+dernière), seul le **complément manquant** est téléchargé puis fusionné. La commande dit
+toujours ce qu'elle a fait (« cache réutilisé tel quel, aucun téléchargement », « cache
+complété / mis à jour ») : lisez cette ligne et vérifiez la période affichée. Si l'exchange
+ne fournit pas plus ancien (Kraken ne donne que les 720 dernières bougies), un avertissement
+le signale et le cache reste inchangé. `--refresh` force un téléchargement complet.
 
 ### Étape 4 — `backtest` : une stratégie, un rapport complet
 
@@ -138,10 +163,24 @@ Le rapport est long, volontairement. Les parties à lire :
   **profit factor** (somme des gains ÷ somme des pertes ; > 1 la stratégie gagne plus
   qu'elle ne perd ; < 1.2 c'est fragile). Un taux de réussite de 35 % peut être excellent
   si les gains sont trois fois plus gros que les pertes : les deux chiffres vont ensemble.
-- **Comparaison avec le buy & hold** et le verdict en une phrase.
+- **Comparaison avec le buy & hold** et le verdict en une phrase. Le buy & hold est mesuré
+  sur la **même période tradable** (à partir de la première bougie après la chauffe de la
+  stratégie) et **frais inclus** : la comparaison est équitable.
+- **Garde-fous déclenchés** : la date et le capital de chaque déclenchement du kill switch
+  (« le robot a cessé de trader le … après une baisse de X % depuis le sommet ») ou de la
+  limite de perte journalière. Un rendement de +4 % avec un kill switch déclenché après six
+  mois signifie que la stratégie n'a *plus rien fait* pendant tout le reste de la période :
+  lisez cette section avant le rendement. Sur des bougies journalières ou plus longues, elle
+  indique que la limite journalière était **inactive** (voir §5).
 - **Les 5 pires / 5 meilleurs trades** : regardez surtout les pires et leur raison de
-  sortie (`stop`, `signal`, `kill switch`…).
+  sortie (`stop`, `signal`, `kill switch`, `limite journ.`…).
 - **Lecture (pour débutant)** : le paragraphe qui traduit tout cela en français courant.
+
+L'en-tête rappelle deux réglages du moteur : **Stop de protection** (toujours présent : le
+stop de la stratégie, sinon un stop de secours à `3 × ATR(14)`, sinon 5 % du prix ; la taille
+de chaque position en découle) et **Ré-entrée après stop** (`wait` : après un stop, un
+objectif ou la limite journalière, le robot attend que le signal soit repassé par 0 avant de
+rentrer du même côté, au lieu de racheter dès la bougie suivante).
 
 Avec `--report-dir`, le robot écrit `equity.csv` (courbe du capital), `trades.csv`,
 `summary.txt`, `metrics.json` et `equity.png` si matplotlib est installé.
@@ -157,7 +196,8 @@ tradingbot compare --exchange binance --symbol BTC/USDT --timeframe 1h
 
 Même tableau que la démo, mais sur de vraies données. Attendez-vous à voir plusieurs
 stratégies **sous** la ligne buy & hold : c'est la réalité. Celles qui ressortent avec un
-Sharpe > 1 **et** un drawdown supportable méritent l'étape suivante.
+Sharpe > 1 **et** un drawdown supportable **et** sans `⚠ arrêt` (kill switch déclenché)
+méritent l'étape suivante.
 
 ### Étape 6 — `optimize` : le test de vérité (walk-forward)
 
@@ -207,6 +247,13 @@ sous forme JSON :
 Relancez la même commande : `"action": "skip"`, `"bougie déjà traitée"`. Le robot ne
 passe jamais deux fois le même ordre, même après un redémarrage (état dans `state/`).
 
+Le récapitulatif affiché avant le JSON rappelle la règle du stop de protection, la politique
+de ré-entrée, si la limite de perte journalière est active pour ce timeframe (elle ne l'est
+pas sur des bougies d'un jour ou plus) et ce que contient déjà le compte (« Position
+existante »). Code de sortie : `0`, ou `1` si l'itération s'est terminée en `"action":
+"error"` (exchange injoignable, ordre refusé…) : un script ou un `cron` qui enchaîne des
+`--once` peut ainsi détecter l'échec.
+
 ### Étape 8 — `paper` : la boucle, pendant des semaines
 
 ```bash
@@ -214,9 +261,23 @@ tradingbot paper --strategy ema_trend --exchange binance --symbol BTC/USDT --tim
 ```
 
 Même chose en continu : interrogation du marché toutes les `durée de bougie / 12`
-(5 minutes en 1h), stop vérifié à chaque interrogation, arrêt propre par `Ctrl-C` (la
-position fictive est mémorisée et reprise au prochain lancement). Le compte fictif est
-dans `state/paper_binance_BTC-USDT.json`.
+(5 minutes en 1h), **stop, kill switch et limite journalière vérifiés à chaque
+interrogation** (le signal, lui, n'est évalué qu'une fois par bougie clôturée), arrêt propre
+par `Ctrl-C` (la position fictive est mémorisée et reprise au prochain lancement ; code de
+sortie `130`).
+
+Chaque boucle a son dossier d'état `state/paper/<exchange>_<symbole>_<timeframe>/`
+(`last_bar.json`, `position.json`, `risk.json`) et son **compte fictif**
+`state/paper/binance_BTC-USDT_1h/account.json` : deux paper tradings sur le même symbole
+mais des timeframes différents ne partagent jamais un compte. Un fichier `lock` dans ce
+dossier garantit **un seul robot à la fois** : lancer une seconde fois la même boucle (ou
+deux `--once` qui se chevauchent) s'arrête net avec « REFUS : le répertoire d'état … est déjà
+utilisé par un autre robot (PID …) » et le code de sortie `2`. Pour faire tourner deux
+robots, donnez-leur un `--state-dir` différent.
+
+Si le compte détient déjà l'actif (vous l'avez acheté à la main) alors que le robot est plat,
+il **ne le vend pas** et refuse d'ouvrir tant qu'il est là ; `--adopt-position` lui confie
+cette position (voir [`docs/PASSER_EN_REEL.md`](docs/PASSER_EN_REEL.md)).
 
 **Laissez tourner plusieurs semaines** et comparez avec le backtest de la même période.
 Si le paper trading ne ressemble pas au backtest, ne passez pas en réel.
@@ -234,10 +295,18 @@ Les réglages de risque sont les plus importants :
 | Clé | Défaut | Rôle |
 |---|---|---|
 | `risk_per_trade` | 0.01 | fraction du capital perdue si le stop est touché (1 %) |
-| `max_position_fraction` | 0.95 | jamais plus de 95 % du capital engagé |
+| `max_position_fraction` | 0.95 | jamais plus de 95 % du capital engagé (1.0 au plus : jamais de levier) |
 | `max_drawdown` | 0.20 | **kill switch** : à –20 % depuis le plus haut, tout est fermé et bloqué |
-| `daily_loss_limit` | 0.05 | –5 % sur la journée UTC : fermé et bloqué jusqu'au lendemain |
-| `allow_short` | false | vente à découvert désactivée (marché au comptant) |
+| `daily_loss_limit` | 0.05 | –5 % sur la journée UTC : fermé et bloqué jusqu'au lendemain. **Bougies < 1 jour seulement** : sur des bougies journalières ou plus longues, chaque bougie est une nouvelle journée et la limite est automatiquement **inactive** (le rapport et le récapitulatif le disent) |
+| `allow_short` | false | vente à découvert désactivée (marché au comptant). `true` est **refusé par `live`** (impossible au comptant) et seulement simulé en `paper` |
+| `default_stop_atr_mult` | 3.0 | stop de secours quand la stratégie n'en donne pas (ou le donne du mauvais côté du prix) : `prix ∓ 3 × ATR(14)` |
+| `default_stop_pct` | 0.05 | stop de dernier recours (5 % du prix) si l'ATR est indisponible ; un avertissement est journalisé |
+
+Une position **ne s'ouvre jamais sans stop**. Ordre de priorité : le stop de la stratégie s'il
+est du bon côté du prix (toutes les stratégies livrées le portent sur **chaque** bougie où
+elles sont en position, pas seulement à l'entrée) ; sinon le stop de secours à `3 × ATR` ;
+sinon 5 % du prix. La taille de la position vient toujours de ce stop (`risk_per_trade`),
+plafonnée par `max_position_fraction` et par le cash disponible.
 
 Les secrets (clés API, jeton Telegram) ne vont **jamais** dans `config.toml` mais dans un
 fichier `.env` (copiez `.env.example`), ignoré par git. Ils ne sont nécessaires que pour le
@@ -253,6 +322,9 @@ limites de risque, **ARGENT RÉEL**) et exige que vous tapiez `OUI`.
 ```bash
 tradingbot live --i-understand-the-risks            # d'abord avec --sandbox si l'exchange le propose
 ```
+
+`live` refuse aussi `allow_short = true` (ou `--allow-short`) : le robot ne trade qu'au
+comptant, et on ne peut pas vendre ce qu'on ne détient pas.
 
 Avant cela : des semaines de paper trading, des clés API **sans droit de retrait**,
 restreintes à votre adresse IP, et un capital que vous pouvez perdre. Le guide détaille
@@ -289,6 +361,16 @@ make format      # ruff format
 make demo        # tradingbot demo
 ```
 
+Sous Windows, `make` n'est généralement pas installé : lancez directement les commandes
+équivalentes, qui sont les mêmes partout :
+
+```
+python -m pytest                      # make test
+ruff check . && ruff format --check . # make lint   (PowerShell : ruff check . ; ruff format --check .)
+ruff format .                         # make format
+python -m tradingbot demo             # make demo
+```
+
 Les tests du moteur, des indicateurs et des stratégies comparent les résultats à des
 valeurs calculées à la main (frais, slippage, stops) et vérifient l'absence de look-ahead.
 L'intégration continue (`.github/workflows/ci.yml`) rejoue tout cela sur Python 3.11 et 3.12.
@@ -302,8 +384,11 @@ L'intégration continue (`.github/workflows/ci.yml`) rejoue tout cela sur Python
   a de trades, de bruit et de frais.
 - **Long / short** : être *long* = avoir acheté, on gagne si le prix monte. Être *short* =
   avoir vendu à découvert, on gagne si le prix baisse (désactivé par défaut ici).
+- **Range (marché sans tendance, « en sur-place », latéral)** : le prix oscille entre un
+  plancher et un plafond sans direction durable. Les stratégies de tendance y perdent, celles
+  de retour à la moyenne y gagnent.
 - **Stop-loss (stop)** : prix auquel on coupe automatiquement une position perdante.
-  La ceinture de sécurité.
+  La ceinture de sécurité. Ici, chaque position en a un, toujours.
 - **Take-profit (objectif)** : prix auquel on encaisse automatiquement un gain.
 - **Drawdown** : baisse du capital depuis son plus haut précédent. Le *max drawdown* est la
   pire de ces baisses.
@@ -331,7 +416,8 @@ L'intégration continue (`.github/workflows/ci.yml`) rejoue tout cela sur Python
 
 ## 10. Avertissement
 
-Ce logiciel est fourni **à des fins pédagogiques**, sans aucune garantie, sous licence MIT.
+Ce logiciel est fourni **à des fins pédagogiques**, sans aucune garantie, sous licence MIT
+(texte complet dans le fichier [`LICENSE`](LICENSE)).
 Il ne constitue pas un conseil en investissement. Le trading de crypto-actifs est très
 risqué et peut entraîner la perte totale du capital engagé. Vous êtes seul responsable
 des ordres passés avec vos clés API, des réglages choisis et des conséquences financières

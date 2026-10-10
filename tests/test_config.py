@@ -60,6 +60,8 @@ daily_loss_limit = 0.03
 allow_short = true
 min_trade_notional = 25
 vol_target = 0.3
+default_stop_atr_mult = 2.5
+default_stop_pct = 0.03
 
 [costs]
 fee_rate = 0.002
@@ -188,6 +190,9 @@ def test_full_file_every_field(tmp_path: Path) -> None:
     assert s.risk.min_trade_notional == 25.0
     assert isinstance(s.risk.min_trade_notional, float)
     assert s.risk.vol_target == 0.3
+    # stop de secours (D1) : lus depuis [risk] comme les autres champs de RiskConfig
+    assert s.risk.default_stop_atr_mult == 2.5
+    assert s.risk.default_stop_pct == 0.03
     assert s.costs == CostSettings(fee_rate=0.002, slippage=0.001)
     assert s.notifications == NotificationSettings(telegram=True)
     assert s.api_key == "key-123"
@@ -573,3 +578,56 @@ def test_parse_scalar(text: str, expected: object) -> None:
     result = parse_scalar(text)
     assert result == expected
     assert type(result) is type(expected)
+
+
+# ============================================================================ [risk] stop de secours
+def test_default_stop_fields_default_to_example_values(tmp_path: Path) -> None:
+    s = load_settings(tmp_path / "absent.toml", env=NO_ENV)
+    assert s.risk.default_stop_atr_mult == 3.0
+    assert s.risk.default_stop_pct == 0.05
+    example = load_settings(EXAMPLE_CONFIG, env=NO_ENV)
+    assert example.risk.default_stop_atr_mult == 3.0 and example.risk.default_stop_pct == 0.05
+
+
+def test_default_stop_fields_partial_override_and_int_coercion(tmp_path: Path) -> None:
+    cfg = write(tmp_path / "config.toml", "[risk]\ndefault_stop_atr_mult = 2\n")
+    s = load_settings(cfg, env=NO_ENV)
+    assert s.risk.default_stop_atr_mult == 2.0 and isinstance(s.risk.default_stop_atr_mult, float)
+    assert s.risk.default_stop_pct == 0.05
+
+
+@pytest.mark.parametrize(
+    ("toml", "key"),
+    [
+        ('[risk]\ndefault_stop_atr_mult = "3"\n', "default_stop_atr_mult"),
+        ("[risk]\ndefault_stop_pct = true\n", "default_stop_pct"),
+    ],
+)
+def test_default_stop_fields_wrong_type_raise(tmp_path: Path, toml: str, key: str) -> None:
+    cfg = write(tmp_path / "config.toml", toml)
+    with pytest.raises(ValueError, match=rf"\[risk\] {key} : valeur invalide"):
+        load_settings(cfg, env=NO_ENV)
+
+
+@pytest.mark.parametrize(
+    ("toml", "fragment"),
+    [
+        ("[risk]\ndefault_stop_atr_mult = 0\n", "default_stop_atr_mult"),
+        ("[risk]\ndefault_stop_atr_mult = -1.5\n", "default_stop_atr_mult"),
+        ("[risk]\ndefault_stop_pct = 0\n", "default_stop_pct"),
+        ("[risk]\ndefault_stop_pct = 1.0\n", "default_stop_pct"),
+        ("[risk]\nmax_position_fraction = 1.5\n", "max_position_fraction"),
+        ("[risk]\nrisk_per_trade = 0\n", "risk_per_trade"),
+    ],
+)
+def test_risk_bounds_are_checked_at_load_time_with_section_prefix(
+    tmp_path: Path, toml: str, fragment: str
+) -> None:
+    cfg = write(tmp_path / "config.toml", toml)
+    with pytest.raises(ValueError, match=r"^\[risk\] .*" + fragment):
+        load_settings(cfg, env=NO_ENV)
+
+
+def test_max_position_fraction_one_is_accepted(tmp_path: Path) -> None:
+    cfg = write(tmp_path / "config.toml", "[risk]\nmax_position_fraction = 1.0\n")
+    assert load_settings(cfg, env=NO_ENV).risk.max_position_fraction == 1.0

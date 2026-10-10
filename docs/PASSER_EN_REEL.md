@@ -22,11 +22,16 @@ Il **ne fait jamais** :
 
 - de retrait (`withdraw`) : le code ne contient aucun appel de ce type ;
 - de levier, de marge, de contrats à terme : marché au comptant uniquement ;
-- de vente à découvert, sauf si vous activez `allow_short` (déconseillé, et impossible
-  au comptant sur la plupart des exchanges).
+- de vente à découvert : au comptant, on ne peut pas vendre ce qu'on ne détient pas, chaque
+  signal short deviendrait un ordre refusé par l'exchange. La commande `live` **refuse donc
+  de démarrer** si `allow_short = true` est dans `config.toml` ou si `--allow-short` est
+  passé (code de sortie 2, explication affichée). En `paper`, la vente à découvert est
+  seulement simulée, avec un avertissement.
 
 Il ne gère **qu'une paire à la fois**. Mettez sur le compte **uniquement** l'argent que vous
-confiez au robot.
+confiez au robot. S'il y trouve déjà l'actif de base (du BTC acheté à la main, par
+exemple) alors qu'il n'a aucune position mémorisée, il **ne le touche pas** et refuse
+d'ouvrir tant qu'il est là ; voir `--adopt-position` au §6.
 
 ## 1. Créer un compte sur un exchange et le sécuriser
 
@@ -66,10 +71,11 @@ Puis :
 ## 3. Mettre la clé dans `.env` (et nulle part ailleurs)
 
 ```bash
-cp .env.example .env
+cp .env.example .env          # Linux / macOS
+copy .env.example .env        # Windows (cmd ; sous PowerShell, cp fonctionne aussi)
 ```
 
-Puis éditez `.env` :
+Puis éditez `.env` (avec n'importe quel éditeur de texte) :
 
 ```
 TRADINGBOT_API_KEY=votre_cle
@@ -78,11 +84,15 @@ TRADINGBOT_API_SECRET=votre_secret
 
 - `.env` est listé dans `.gitignore` : il ne sera jamais envoyé sur git. Ne le copiez pas
   dans `config.toml`, un script, un message, une capture d'écran.
-- Sur un serveur partagé, restreignez les droits du fichier : `chmod 600 .env`.
+- Sur un serveur partagé (Linux / macOS), restreignez les droits du fichier : `chmod 600
+  .env`. Sous Windows, `chmod` n'existe pas : vérifiez que seul votre compte utilisateur a
+  accès au dossier (clic droit → Propriétés → Sécurité).
 - Les variables d'environnement du système (`export TRADINGBOT_API_KEY=...`) sont acceptées
   et prioritaires sur `.env`.
-- Le robot **n'affiche jamais** les secrets (ils apparaissent comme `***` dans les
-  journaux).
+- Le robot **n'affiche jamais** les secrets : clé, secret et jeton Telegram apparaissent
+  comme `***` dans les journaux et les messages d'erreur (y compris les URL signées que
+  certains exchanges recopient dans leurs erreurs), et l'identifiant de chat Telegram n'est
+  pas journalisé.
 
 ## 4. Configurer `config.toml`
 
@@ -98,21 +108,28 @@ state_dir = "state"
 name = "ema_trend"        # celle qui a passé le walk-forward ET le paper trading
 
 [risk]
-initial_cash = 300.0      # capital de référence : ce que vous avez mis sur le compte
+initial_cash = 300.0      # indicatif en live : le vrai solde est lu sur l'exchange
 risk_per_trade = 0.01
 max_position_fraction = 0.95
 max_drawdown = 0.20
-daily_loss_limit = 0.05
-allow_short = false
+daily_loss_limit = 0.05   # bougies < 1 jour seulement (inactive en 1d et au-delà)
+allow_short = false       # obligatoire en live (spot)
+default_stop_atr_mult = 3.0   # stop de secours si la stratégie n'en donne pas
+default_stop_pct = 0.05       # stop de dernier recours si l'ATR est indisponible
 ```
 
-Deux remarques :
+Trois remarques :
 
 - gardez la **même stratégie et les mêmes paramètres** qu'en paper trading. Changer quelque
   chose au moment de passer en réel revient à repartir de zéro ;
-- `ema_trend` fournit un stop suiveur à chaque bougie : c'est la stratégie la plus adaptée
-  à un robot qui démarre au milieu d'une tendance (les autres n'émettent leur stop qu'à la
-  bougie d'entrée ; voir le guide du débutant).
+- en live, `initial_cash` n'est **qu'affiché** dans le récapitulatif : la taille des
+  positions et les garde-fous se calculent sur l'équité réelle lue sur l'exchange (cash +
+  valeur de la position). En paper, c'est le capital fictif de départ (`--initial-cash`
+  le remplace) ;
+- toutes les stratégies livrées portent leur stop sur **chaque** bougie en position, et le
+  robot n'ouvre **jamais** sans stop (stratégie, sinon 3 × ATR, sinon 5 % du prix) : un robot
+  qui démarre au milieu d'une tendance entre protégé et dimensionné sur le risque.
+  `ema_trend` a en plus un stop **suiveur**, qui remonte avec le prix.
 
 ## 5. D'abord le testnet / sandbox, si l'exchange en propose un
 
@@ -152,23 +169,41 @@ Récapitulatif avant connexion :
   Symbole                     : BTC/USDT
   Timeframe                   : 1h
   Stratégie                   : ema_trend (fast=20, slow=50, ...)
-  Capital de référence        : 300.00
+  Capital de référence        : 300.00 (indicatif : le solde réel vient de l'exchange)
   Risque par trade            : 1.00 %
   Position maximale           : 95.00 % du capital
+  Stop de protection          : toujours présent : stop de la stratégie s'il est du bon côté du prix, sinon 3 × ATR(14), sinon 5.00 % du prix ; taille = risque par trade
+  Ré-entrée après stop        : attente d'un nouveau signal après un stop / objectif / limite journalière (wait)
   Kill switch (drawdown)      : 20.00 %
   Limite de perte journalière : 5.00 %
   Vente à découvert           : désactivée
-  ...
+  Notionnel minimal           : 10
+  Fichiers d'état             : state/live/binance_BTC-USDT_1h (un seul robot à la fois : verrou « lock »)
   Mode                        : ARGENT RÉEL
 Tapez OUI (en majuscules) pour confirmer, autre chose pour annuler :
 ```
 
+Avec `--timeframe 1d` (ou plus), la ligne « Limite de perte journalière » se termine par
+« INACTIVE sur ce timeframe (bougies >= 1 jour…) » : c'est voulu, voir §9.
+
 Lisez chaque ligne. Tapez `OUI` seulement si tout est exactement ce que vous voulez.
 (`--yes` saute cette question : réservez-le à un lancement automatisé que vous avez déjà
-validé à la main.)
+validé à la main.) Après la connexion, le robot affiche le solde réel et la ligne
+« Position existante » : ce que le compte détient déjà et ce qu'il va en faire.
 
 `--once` fait une seule itération et affiche l'état : c'est la façon la plus sûre de
-vérifier que la connexion, le solde et les quantités sont corrects avant la boucle.
+vérifier que la connexion, le solde et les quantités sont corrects avant la boucle. Code
+de sortie `0` si l'itération s'est bien passée, `1` si elle s'est terminée en `"action":
+"error"` (exchange injoignable, ordre refusé…).
+
+**L'actif est déjà sur le compte ?** Si le robot trouve du BTC alors qu'il n'a aucune
+position mémorisée (`position.json` vide), il considère cette position comme **non gérée** :
+il ne la vend pas, ne lui met pas de stop et **refuse d'ouvrir** (`refused`, « position
+existante non gérée par le robot ») tant qu'elle est là. Deux issues : vendez-la à la main,
+ou relancez avec **`--adopt-position`** pour la lui confier ; il la gérera alors comme la
+sienne (sans stop jusqu'au prochain stop de la stratégie, donc sous la seule protection du
+kill switch jusque-là). Inversement, le robot ne vend jamais plus que **sa propre** quantité :
+un achat manuel fait *en plus* de sa position n'est pas touché.
 
 Puis la boucle :
 
@@ -191,7 +226,13 @@ interrogation ; il ne pose **pas** d'ordre stop sur l'exchange). Options :
 - un gestionnaire de processus (`systemd`, `supervisor`, `tmux`/`screen` au minimum) qui
   relance le robot s'il plante : l'état est persistant, un redémarrage reprend la position
   et son stop sans passer d'ordre en double ;
-- surveillez les journaux (`--log-level info`) et les notifications.
+- surveillez les journaux (`--log-level info`) et les notifications ;
+- **un seul robot par dossier d'état** : le fichier `state/live/<exchange>_<symbole>_<timeframe>/lock`
+  est verrouillé par le robot qui tourne. Si votre gestionnaire de processus (ou vous)
+  lance une seconde instance sur le même dossier, elle s'arrête immédiatement avec « REFUS :
+  le répertoire d'état … est déjà utilisé par un autre robot (PID …) » et le code de sortie
+  `2` — jamais deux robots sur le même compte sans le savoir. Un `--once` rend le verrou dès
+  la fin de son itération.
 
 Si le robot est arrêté longtemps avec une position ouverte, **fermez-la à la main** sur
 l'exchange ou relancez-le vite : pendant l'arrêt, personne ne surveille le stop.
@@ -200,8 +241,10 @@ l'exchange ou relancez-le vite : pendant l'arrêt, personne ne surveille le stop
 
 - **Arrêt propre** : `Ctrl-C` dans le terminal. Le robot termine l'itération en cours,
   journalise « Arrêt demandé », **ne ferme pas la position** (elle est mémorisée dans
-  `state/live/<exchange>_<symbole>_<timeframe>/position.json`) et reprendra au prochain
-  lancement.
+  `state/live/<exchange>_<symbole>_<timeframe>/position.json`), libère le verrou et quitte
+  avec le code de sortie `130` (la convention des shells pour « interrompu ») : un
+  superviseur distingue ainsi un arrêt volontaire d'une fin normale (`0`) ou d'une erreur
+  (`1`). La position reprend au prochain lancement.
 - **Fermer la position** : soit sur le site de l'exchange (vendez la quantité détenue),
   soit en relançant le robot : il constatera que le broker est plat et remettra son état à
   zéro.
@@ -211,35 +254,57 @@ l'exchange ou relancez-le vite : pendant l'arrêt, personne ne surveille le stop
 
 ## 9. Le kill switch et la limite journalière
 
-Le gestionnaire de risque suit l'équité (cash + valeur de la position) à chaque itération.
+Le gestionnaire de risque suit l'équité (cash + valeur de la position) à **chaque
+interrogation du marché** (toutes les `durée de bougie / 12`, soit 5 minutes en 1h ; `--poll`
+pour changer), et pas seulement à la clôture d'une bougie. Précisément : à chaque
+interrogation, le robot vérifie d'abord le stop, puis le kill switch et la limite
+journalière ; le signal de la stratégie, lui, n'est évalué qu'une fois par bougie clôturée.
+Entre deux interrogations, **rien n'est surveillé** : avec `--poll 300`, une chute de 30 %
+en deux minutes n'est vue qu'à l'interrogation suivante. Ces garde-fous bornent les dégâts
+*après* la perte ; ils ne la préviennent pas.
 
-- **Kill switch** (`max_drawdown`, 20 % par défaut) : dès que l'équité est tombée de plus
-  de 20 % sous son plus haut, le robot **ferme la position**, refuse toute nouvelle
-  ouverture et **arrête la boucle**. L'état est écrit dans `risk.json` : relancer le robot
-  ne le réarme pas. Pour le réarmer, après avoir compris ce qui s'est passé, supprimez
-  `state/live/<exchange>_<symbole>_<timeframe>/risk.json` (ou tout le dossier d'état pour
-  repartir de zéro). Ne le faites pas à chaud, sous le coup de la perte.
+- **Kill switch** (`max_drawdown`, 20 % par défaut) : dès qu'une interrogation constate une
+  équité tombée de plus de 20 % sous son plus haut, le robot **ferme la position** (ordre au
+  marché), refuse toute nouvelle ouverture et **arrête la boucle**. L'état est écrit dans
+  `risk.json` : relancer le robot ne le réarme pas. Pour le réarmer, après avoir compris ce
+  qui s'est passé, supprimez `state/live/<exchange>_<symbole>_<timeframe>/risk.json` (ou
+  tout le dossier d'état pour repartir de zéro). Ne le faites pas à chaud, sous le coup de
+  la perte.
 - **Limite journalière** (`daily_loss_limit`, 5 % par défaut) : à –5 % depuis l'équité de
   début de journée (UTC), position fermée, aucune ouverture jusqu'au lendemain. Elle se
-  réarme seule au changement de jour.
-- **Stop** : vérifié contre le prix courant à chaque interrogation ; s'il est franchi, la
-  position est fermée au marché, et aucune ré-entrée n'a lieu avant la bougie suivante.
+  réarme seule au changement de jour. Elle n'a de sens qu'en **intrajournalier** : avec un
+  timeframe d'un jour ou plus (`1d`, `1w`), chaque bougie est une nouvelle journée et elle
+  est automatiquement **inactive** (le récapitulatif l'indique ; le kill switch reste
+  actif). Après une sortie sur limite journalière, le côté sorti reste bloqué (voir « Stop »).
+- **Stop** : vérifié contre le prix courant à chaque interrogation, **avant** même de
+  demander les bougies (une panne de la source de données ne le désarme pas) ; s'il est
+  franchi, la position est fermée au marché. Ensuite, politique **`wait`** : le robot ne
+  rentre pas du même côté tant que le signal de la stratégie n'est pas repassé par plat (ou
+  ne s'est pas retourné) sur une bougie clôturée ultérieure — même si la stratégie dit
+  toujours « long » à la bougie suivante. Le côté bloqué est mémorisé dans `position.json`
+  (`blocked_side`) et survit à un redémarrage. La même règle s'applique après un objectif
+  atteint et après la limite journalière.
 - **Refus** : si le gestionnaire de risque refuse une ouverture (`refused`), c'est voulu.
   Ne « forcez » pas.
 
 Ces mécanismes agissent **après** la perte, pas avant : ils bornent les dégâts, ils ne les
-empêchent pas. D'où le capital petit.
+empêchent pas. D'où le capital petit. En backtest, la section « Garde-fous déclenchés » du
+rapport vous montre à l'avance combien de fois ils seraient intervenus.
 
 ## 10. Ce qui peut mal tourner (et quoi faire)
 
 | Problème | Conséquence | Que faire |
 |---|---|---|
-| Coupure réseau / API en panne | l'itération renvoie `error`, le robot réessaie à l'interrogation suivante ; le stop n'est pas surveillé pendant ce temps | surveiller les notifications ; au besoin fermer à la main |
+| Coupure réseau / API en panne | l'itération renvoie `error` (code de sortie 1 avec `--once`), le robot réessaie à l'interrogation suivante ; le stop est quand même vérifié dès que le prix est à nouveau disponible, avant les bougies | surveiller les notifications ; au besoin fermer à la main |
+| Deux robots lancés sur le même dossier d'état | le second s'arrête aussitôt (`REFUS … déjà utilisé par un autre robot`, code 2) | arrêter l'autre, ou choisir un `--state-dir` différent |
 | Gap de prix (le marché saute par-dessus le stop) | perte plus grande que `risk_per_trade` | normal, c'est pour cela que la position est plafonnée |
-| Ordre refusé (quantité sous le minimum, fonds insuffisants) | `error` ou `skip` ; pas d'ordre | augmenter le capital ou choisir un actif moins cher |
+| Ordre refusé (quantité sous le minimum, fonds insuffisants) | `error` ou `skip` ; pas d'ordre, l'état mémorisé et son stop sont conservés | augmenter le capital ou choisir un actif moins cher |
+| Ordre de clôture partiellement exécuté | `error`, la quantité restante est mémorisée et la clôture retentée à l'interrogation suivante | surveiller ; au besoin finir à la main |
 | Clé API expirée / IP changée | `error` à chaque itération | créer une nouvelle clé, mettre à jour `.env` |
 | Machine éteinte avec une position ouverte | personne ne surveille le stop | relancer vite ou fermer à la main |
-| Vous intervenez à la main sur l'exchange | le robot adopte la position du broker (sans stop) ou remet son état à zéro | évitez ; sinon, arrêtez le robot d'abord |
+| Vous vendez à la main la position du robot | il constate que le compte est plat et remet son état à zéro | prévenez-le plutôt : arrêtez-le d'abord |
+| Vous achetez l'actif à la main alors que le robot est plat | il ne touche pas ce solde, le signale et **refuse d'ouvrir** tant qu'il est là | vendez-le, ou `--adopt-position` pour le lui confier |
+| Vous achetez l'actif à la main en plus de la position du robot | il ne gère et ne vend que **sa** quantité | évitez ; sinon, arrêtez le robot d'abord |
 
 ## 11. Et ensuite
 

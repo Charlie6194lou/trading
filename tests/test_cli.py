@@ -490,14 +490,18 @@ def test_backtest_from_exchange_uses_cache(
     assert code == 0
     assert "Données : BTC/USDT 1h sur binance" in out
     assert "700 bougies" in out
+    assert "téléchargées et mises en cache" in out
     assert (cache_dir / "binance_BTC-USDT_1h.csv").is_file()
     assert len(fake_exchange.ohlcv_calls) == 1
     code, out, _err = _run(capsys, argv)
     assert code == 0
     assert len(fake_exchange.ohlcv_calls) == 1  # deuxième fois : cache, aucun appel
-    code, _out, _err = _run(capsys, [*argv, "--refresh"])
+    assert "cache réutilisé tel quel, aucun téléchargement" in out  # F32 : dit clairement
+    time.sleep(0.01)  # mtime distinct pour le téléchargement forcé
+    code, out, _err = _run(capsys, [*argv, "--refresh"])
     assert code == 0
     assert len(fake_exchange.ohlcv_calls) == 2
+    assert "cache complété / mis à jour" in out
 
 
 def test_backtest_exchange_defaults_from_config(
@@ -927,11 +931,14 @@ def test_paper_data_source_error_is_reported_not_raised(
             raise RuntimeError("API indisponible")
 
     monkeypatch.setattr(cli, "build_public_exchange", lambda exchange_id: Down(rising_ohlcv()))
-    code, out, _err = _run(capsys, _paper_argv(tmp_path))
-    assert code == 0
+    code, out, err = _run(capsys, _paper_argv(tmp_path))
+    # F44 : l'état est affiché (pas d'exception), mais le code de sortie dit l'échec à un
+    # script / cron qui enchaîne des `--once`
+    assert code == 1
     state = json.loads(out[out.index("{") :])
     assert state["action"] == "error"
     assert "API indisponible" in state["reason"]
+    assert "code de sortie 1" in err
 
 
 # ============================================================================ live
@@ -1163,3 +1170,262 @@ def test_offline_commands_dedup_logs_and_paper_live_do_not() -> None:
         assert parser.parse_args([command]).dedup_logs is True, command
     for command in ("download", "paper", "live"):
         assert getattr(parser.parse_args([command]), "dedup_logs", False) is False, command
+
+
+# ============================================================================ F32 : cache et --since
+def test_download_with_since_before_cache_reports_cache_reuse(
+    fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cache_dir = tmp_path / "cache"
+    base = ["download", "--exchange", "binance", "--symbol", "BTC/USDT", "--timeframe", "1h"]
+    code, out, _err = _run(capsys, [*base, "--cache-dir", str(cache_dir)])
+    assert code == 0
+    assert "téléchargement..." in out and "téléchargées et mises en cache" in out
+    # --since antérieur au cache : le chargeur demande le complément ; l'exchange (faux) n'a
+    # rien d'antérieur à janvier 2024, le cache reste donc inchangé, et la sortie le DIT au
+    # lieu d'annoncer un téléchargement « depuis 2023-12-01 »
+    code, out, err = _run(capsys, [*base, "--cache-dir", str(cache_dir), "--since", "2023-12-01"])
+    assert code == 0
+    assert "cache existant, seul le complément manquant sera téléchargé" in out
+    assert "cache réutilisé tel quel, aucun téléchargement" in out
+    assert "Téléchargement de" not in out
+    assert len(fake_exchange.ohlcv_calls) == 2  # un appel pour le complément (vide)
+    assert "inchangé" in err  # avertissement du chargeur : rien de plus ancien disponible
+    assert "--refresh" in out
+
+
+# ============================================================================ F29 : chat Telegram
+def test_build_notifier_never_logs_the_telegram_chat_id(caplog: pytest.LogCaptureFixture) -> None:
+    from tradingbot.config import NotificationSettings, Settings
+
+    settings = Settings(
+        notifications=NotificationSettings(telegram=True),
+        telegram_token="123:ABC",
+        telegram_chat_id="987654321",
+    )
+    caplog.set_level(logging.DEBUG, logger="tradingbot")
+    notifier = cli._build_notifier(settings)
+    assert type(notifier).__name__ == "MultiNotifier"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "Telegram activées" in text
+    assert "987654321" not in text and "123:ABC" not in text
+
+
+# ============================================================================ F36 : capital affiché
+def test_paper_recap_shows_effective_initial_cash(
+    fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("[risk]\ninitial_cash = 1000.0\n", encoding="utf-8")
+    code, out, _err = _run(
+        capsys, _paper_argv(tmp_path, "--config", str(config), "--initial-cash", "5000")
+    )
+    assert code == 0
+    recap = out[: out.index("{")]
+    assert "Capital de référence" in recap
+    assert "5 000.00" in recap.split("Capital de référence")[1].splitlines()[0]
+    assert "1 000.00" not in recap  # plus deux capitaux contradictoires à l'écran
+    assert "cash 5 000.00" in recap
+
+
+# ============================================================================ récapitulatif
+def test_paper_recap_shows_stop_rule_reentry_and_daily_limit(
+    fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, _err = _run(capsys, _paper_argv(tmp_path))
+    assert code == 0
+    recap = out[: out.index("{")]
+    assert "Stop de protection" in recap and "3 × ATR(14)" in recap and "5.00 % du prix" in recap
+    assert "Ré-entrée après stop" in recap and "(wait)" in recap
+    assert "Limite de perte journalière : 5.00 %" in recap
+    assert "INACTIVE" not in recap  # bougies d'une heure : la limite s'applique
+    assert "verrou" in recap
+    assert "Position existante          : aucune (BTC absent du compte)" in recap
+
+
+def test_paper_recap_daily_limit_inactive_on_daily_candles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    daily = rising_ohlcv(400)
+    # 400 bougies journalières qui se terminent hier (le chargeur ne demande à l'exchange que
+    # les bougies récentes : « maintenant - (lookback + 1) jours »)
+    start = pd.Timestamp.now(tz="UTC").normalize() - pd.Timedelta(days=400)
+    daily.index = pd.date_range(start=start, periods=len(daily), freq="1D", tz="UTC")
+    exchange = FakeExchange(daily)
+    monkeypatch.setattr(cli, "build_public_exchange", lambda exchange_id: exchange)
+    argv = [a if a != "1h" else "1d" for a in _paper_argv(tmp_path)]
+    code, out, _err = _run(capsys, argv)
+    assert code == 0
+    recap = out[: out.index("{")]
+    assert "Limite de perte journalière : 5.00 % — INACTIVE sur ce timeframe" in recap
+    assert "bougies >= 1 jour" in recap
+
+
+# ============================================================================ F10 : short en live
+def test_live_refuses_allow_short_from_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_keys(monkeypatch)
+    _forbid_real_broker(monkeypatch)
+    config = _live_config(tmp_path)
+    config.write_text(config.read_text(encoding="utf-8") + "[risk]\nallow_short = true\n")
+    code, out, err = _run(
+        capsys, ["live", "--config", str(config), "--i-understand-the-risks", "--yes"]
+    )
+    assert code == 2
+    assert "REFUS" in err and "vente à découvert" in err and "allow_short = false" in err
+    assert "comptant" in err
+    assert out == ""  # aucune connexion, aucun récapitulatif
+
+
+def test_live_refuses_allow_short_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_keys(monkeypatch)
+    _forbid_real_broker(monkeypatch)
+    config = _live_config(tmp_path)
+    code, _out, err = _run(
+        capsys,
+        ["live", "--config", str(config), "--i-understand-the-risks", "--yes", "--allow-short"],
+    )
+    assert code == 2
+    assert "--allow-short" in err and "vente à découvert" in err
+    assert 'écrivez mode = "live"' not in err  # les autres verrous sont levés
+
+
+def test_paper_allow_short_is_a_simulation_with_a_warning(
+    fake_exchange: FakeExchange,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="tradingbot.cli")
+    code, out, _err = _run(capsys, _paper_argv(tmp_path, "--allow-short"))
+    assert code == 0
+    recap = out[: out.index("{")]
+    assert "Vente à découvert" in recap and "simulation seulement" in recap
+    assert any("simulation" in r.getMessage() and "live" in r.getMessage() for r in caplog.records)
+
+
+# ============================================================================ F7 : verrou
+def _paper_state_dir(tmp_path: Path) -> Path:
+    return tmp_path / "state" / "paper" / "binance_BTC-USDT_1h"
+
+
+def test_paper_refuses_when_state_dir_is_locked_by_another_robot(
+    fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tradingbot.live.runner import StateDirLock
+
+    other = StateDirLock(_paper_state_dir(tmp_path))
+    other.acquire()
+    try:
+        code, out, err = _run(capsys, _paper_argv(tmp_path))
+        assert code == 2
+        assert "REFUS" in err and "déjà utilisé par un autre robot" in err
+        assert str(os.getpid()) in err  # le PID du détenteur aide à le retrouver
+        assert "{" not in out  # aucune itération n'a eu lieu
+        assert not (_paper_state_dir(tmp_path) / "position.json").exists()
+    finally:
+        other.release()
+    # l'autre robot s'arrête : la commande passe
+    assert _run(capsys, _paper_argv(tmp_path))[0] == 0
+
+
+def test_paper_once_releases_the_lock_before_returning(
+    fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from tradingbot.live.runner import StateDirLock
+
+    assert _run(capsys, _paper_argv(tmp_path))[0] == 0
+    lock = StateDirLock(_paper_state_dir(tmp_path))
+    lock.acquire()  # ne lève pas : le verrou a été rendu par --once
+    assert lock.held
+    lock.release()
+
+
+# ============================================================================ F45 : Ctrl-C → 130
+def test_paper_loop_interrupted_exits_130_and_releases_lock(
+    fake_exchange: FakeExchange,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from tradingbot.live.runner import LiveTrader, StateDirLock
+
+    def ctrl_c(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    class InterruptedTrader(LiveTrader):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["sleep"] = ctrl_c  # Ctrl-C pendant l'attente entre deux interrogations
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "LiveTrader", InterruptedTrader)
+    argv = [a for a in _paper_argv(tmp_path) if a != "--once"]
+    code, out, err = _run(capsys, [*argv, "--max-iterations", "3"])
+    assert code == 130
+    assert "Boucle démarrée" in out
+    assert "Arrêt demandé (Ctrl-C)" in err
+    assert len(fake_exchange.ohlcv_calls) == 1  # une itération, puis l'interruption
+    # la position fictive est mémorisée et le verrou rendu
+    assert json.loads((_paper_state_dir(tmp_path) / "position.json").read_text())["side"] == 1
+    lock = StateDirLock(_paper_state_dir(tmp_path))
+    lock.acquire()
+    lock.release()
+
+
+# ============================================================================ --adopt-position
+def _seed_paper_account_with_btc(tmp_path: Path, amount: float = 0.5) -> Path:
+    """Compte fictif qui détient déjà du BTC alors que le robot n'a aucune position mémorisée."""
+    account = _paper_state_dir(tmp_path) / "account.json"
+    account.parent.mkdir(parents=True)
+    broker = PaperBroker(initial_cash=1000.0, state_path=account)
+    broker.set_price("BTC/USDT", 100.0)
+    broker.market_order("BTC/USDT", "buy", amount)
+    broker.save()
+    return account
+
+
+def test_paper_existing_balance_not_adopted_without_flag(
+    fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_paper_account_with_btc(tmp_path)
+    code, out, _err = _run(capsys, _paper_argv(tmp_path))
+    assert code == 0
+    recap = out[: out.index("{")]
+    assert "Position existante          : 0.5 BTC NON gérés par le robot" in recap
+    assert "--adopt-position" in recap
+    state = json.loads(out[out.index("{") :])
+    assert state["signal"] == 1 and state["action"] == "refused" and state["position"] == 0
+    assert "position existante non gérée" in state["reason"]
+    saved = json.loads((_paper_state_dir(tmp_path) / "account.json").read_text(encoding="utf-8"))
+    assert len(saved["orders"]) == 1  # rien vendu, rien acheté
+
+
+def test_paper_adopt_position_flag_hands_the_balance_to_the_robot(
+    fake_exchange: FakeExchange, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_paper_account_with_btc(tmp_path)
+    code, out, _err = _run(capsys, _paper_argv(tmp_path, "--adopt-position"))
+    assert code == 0
+    recap = out[: out.index("{")]
+    assert "Position existante          : 0.5 BTC CONFIÉS au robot (--adopt-position)" in recap
+    state = json.loads(out[out.index("{") :])
+    assert state["signal"] == 1 and state["position"] == 1
+    assert state["action"] == "hold" and state["amount"] == pytest.approx(0.5)
+    assert state["stop_loss"] is not None  # le stop de la stratégie protège la position adoptée
+    record = json.loads((_paper_state_dir(tmp_path) / "position.json").read_text(encoding="utf-8"))
+    assert record["side"] == 1 and record["amount"] == pytest.approx(0.5)
+    # au redémarrage, c'est désormais la position DU robot (position.json), plus un solde étranger
+    code, out, _err = _run(capsys, _paper_argv(tmp_path))
+    assert code == 0
+    assert "position du robot reprise de position.json" in out[: out.index("{")]
+
+
+def test_adopt_position_flag_is_accepted_by_paper_and_live_parsers() -> None:
+    parser = cli.build_parser()
+    for command in ("paper", "live"):
+        args = parser.parse_args([command, "--adopt-position"])
+        assert args.adopt_position is True, command
+        assert parser.parse_args([command]).adopt_position is False, command

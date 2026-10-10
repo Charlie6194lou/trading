@@ -13,8 +13,10 @@ Commandes (toutes les sorties sont en français) :
   ``config.toml``, le drapeau ``--i-understand-the-risks`` et les clés API dans ``.env``),
   avec récapitulatif et confirmation ``OUI``.
 
-Codes de sortie : ``0`` succès, ``1`` erreur, ``2`` refus de sécurité ou arguments
-invalides. C'est le seul module autorisé à utiliser ``print``.
+Codes de sortie : ``0`` succès, ``1`` erreur (dont une itération ``--once`` terminée en
+action ``error``), ``2`` refus de sécurité, arguments invalides ou répertoire d'état déjà
+utilisé par un autre robot (``StateLockedError``), ``130`` arrêt par Ctrl-C. C'est le seul
+module autorisé à utiliser ``print``.
 """
 
 from __future__ import annotations
@@ -32,25 +34,45 @@ import pandas as pd
 
 from tradingbot import __version__
 from tradingbot.backtest.engine import BacktestConfig, BacktestResult, run_backtest
-from tradingbot.backtest.report import format_comparison, format_report, save_report
+from tradingbot.backtest.report import (
+    REENTRY_LABELS,
+    format_comparison,
+    format_report,
+    save_report,
+)
 from tradingbot.backtest.walkforward import WalkForwardResult, default_windows, walk_forward
 from tradingbot.config import Settings, load_settings, parse_param_overrides
-from tradingbot.data.loader import cache_path, fetch_ohlcv, load_csv, load_or_fetch, save_csv
+from tradingbot.data.loader import (
+    cache_path,
+    fetch_ohlcv,
+    load_csv,
+    load_or_fetch,
+    save_csv,
+    timeframe_to_timedelta,
+)
 from tradingbot.data.synthetic import generate_ohlcv
 from tradingbot.execution.broker import Broker, BrokerError
 from tradingbot.execution.ccxt_broker import CcxtBroker
 from tradingbot.execution.paper import PaperBroker
 from tradingbot.live.notifier import LogNotifier, MultiNotifier, Notifier, TelegramNotifier
-from tradingbot.live.runner import LiveTrader
-from tradingbot.risk import RiskConfig, RiskManager
+from tradingbot.live.runner import LiveTrader, StateLockedError
+from tradingbot.risk import DEFAULT_STOP_ATR_WINDOW, RiskConfig, RiskManager
 from tradingbot.strategies import STRATEGIES, Strategy, get_strategy, list_strategies
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["DEMO_WARNING", "CliError", "build_public_exchange", "main"]
 
-#: code de sortie d'un refus de sécurité (commande ``live``) ou d'arguments invalides
+#: code de sortie d'un refus de sécurité (commande ``live``), d'arguments invalides ou d'un
+#: répertoire d'état déjà utilisé par un autre robot
 EXIT_REFUSED = 2
+#: code de sortie d'un arrêt demandé par Ctrl-C (convention des shells : 128 + SIGINT)
+EXIT_INTERRUPTED = 130
+#: politique de ré-entrée après une sortie décidée par le robot (stop, objectif, limite
+#: journalière) en paper / live : la même que le moteur de backtest par défaut
+REENTRY_POLICY = "wait"
+#: durée de bougie à partir de laquelle la limite de perte journalière n'a plus de sens
+ONE_DAY = pd.Timedelta(days=1)
 #: nombre de bougies synthétiques de la démo
 DEMO_BARS = 3000
 #: graine fixe de la démo : le même résultat à chaque exécution
@@ -253,6 +275,8 @@ def _load_data(args: argparse.Namespace, settings: Settings) -> pd.DataFrame:
         f"Données : {symbol} {timeframe} sur {exchange_id} "
         f"(cache {cache_dir}, depuis {getattr(args, 'since', None) or 'les bougies les plus récentes'})"
     )
+    path = cache_path(cache_dir, exchange_id, symbol, timeframe)
+    before = _cache_signature(path)
     df = load_or_fetch(
         exchange_id,
         symbol,
@@ -267,8 +291,31 @@ def _load_data(args: argparse.Namespace, settings: Settings) -> pd.DataFrame:
             f"Aucune bougie reçue pour {symbol} {timeframe} sur {exchange_id} : vérifiez le "
             "symbole, le timeframe et votre connexion."
         )
-    _print(f"          {len(df)} bougies ({_period(df)})")
+    _print(f"          {len(df)} bougies ({_period(df)}) ; {_cache_status(path, before)}")
     return df
+
+
+def _cache_signature(path: Path) -> tuple[int, int] | None:
+    """(mtime, taille) du fichier de cache, ``None`` s'il n'existe pas."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _cache_status(path: Path, before: tuple[int, int] | None) -> str:
+    """Phrase (FR) disant ce que :func:`load_or_fetch` a fait du cache ``path``.
+
+    Un débutant qui passe ``--since 2023-01-01`` doit savoir si des bougies ont été
+    téléchargées ou si le cache a été réutilisé tel quel.
+    """
+    after = _cache_signature(path)
+    if before is None:
+        return "téléchargées et mises en cache" if after is not None else "aucun cache écrit"
+    if after == before:
+        return "cache réutilisé tel quel, aucun téléchargement (--refresh pour retélécharger)"
+    return "cache complété / mis à jour par téléchargement"
 
 
 def _period(df: pd.DataFrame) -> str:
@@ -350,7 +397,8 @@ def _build_notifier(settings: Settings) -> Notifier:
         notifiers.append(
             TelegramNotifier(str(settings.telegram_token), str(settings.telegram_chat_id))
         )
-        logger.info("Notifications Telegram activées (chat %s)", settings.telegram_chat_id)
+        # l'identifiant de chat est un secret (SECRET_FIELDS) : jamais en clair dans le journal
+        logger.info("Notifications Telegram activées (jeton et chat lus dans .env)")
     elif settings.notifications.telegram:
         logger.warning(
             "Telegram demandé dans la configuration mais TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID "
@@ -390,10 +438,25 @@ def _trading_lookback(args: argparse.Namespace, strategy: Strategy) -> int:
 
 
 def _run_trader(trader: LiveTrader, args: argparse.Namespace) -> int:
-    """``--once`` : une itération et affichage de l'état ; sinon la boucle."""
+    """``--once`` : une itération et affichage de l'état ; sinon la boucle.
+
+    Codes de sortie : ``1`` si l'itération ``--once`` se termine en action ``error`` (un
+    script ou un cron peut ainsi détecter l'échec) ; ``StateLockedError`` (un autre robot
+    utilise déjà le répertoire d'état) et ``KeyboardInterrupt`` (relancée par
+    :meth:`LiveTrader.run` après son nettoyage) remontent à :func:`main` → ``2`` / ``130``.
+    """
     if getattr(args, "once", False):
-        state = trader.step()
+        try:
+            state = trader.step()
+        finally:
+            trader.close()  # verrou libéré tout de suite, pas à la fin du processus
         _print(json.dumps(state, indent=2, ensure_ascii=False, default=str))
+        if state.get("action") == "error":
+            _eprint(
+                "L'itération s'est terminée en erreur (voir « reason » ci-dessus) : code de "
+                "sortie 1. Rien n'a été modifié ; relancez quand la cause est corrigée."
+            )
+            return 1
         return 0
     max_iterations = getattr(args, "max_iterations", None)
     poll = getattr(args, "poll", None)
@@ -408,6 +471,12 @@ def _fmt_fraction(value: float | None) -> str:
     return f"{float(value) * 100:.2f} %"
 
 
+def _daily_limit_active(timeframe: str) -> bool:
+    """La limite de perte journalière n'a de sens qu'en intrajournalier (même règle que
+    ``LiveTrader`` et le moteur : bougie < 1 jour)."""
+    return timeframe_to_timedelta(timeframe) < ONE_DAY
+
+
 def _recap_lines(
     settings: Settings,
     exchange_id: str,
@@ -417,9 +486,28 @@ def _recap_lines(
     risk: RiskConfig,
     state_dir: Path,
     sandbox: bool,
+    *,
+    initial_cash: float | None = None,
+    reentry: str = REENTRY_POLICY,
+    paper: bool = False,
 ) -> list[str]:
-    """Récapitulatif affiché avant tout trading (paper ou live)."""
+    """Récapitulatif affiché avant tout trading (paper ou live).
+
+    ``initial_cash`` : capital effectif (``--initial-cash`` prime sur la config) ; en live
+    il n'est qu'indicatif, le vrai solde vient de l'exchange. ``paper`` : la vente à
+    découvert est alors une simulation (impossible au comptant en réel).
+    """
     mode = "SANDBOX / TESTNET (argent fictif de l'exchange)" if sandbox else "ARGENT RÉEL"
+    cash = settings.initial_cash if initial_cash is None else float(initial_cash)
+    daily = _fmt_fraction(risk.daily_loss_limit)
+    if risk.daily_loss_limit and not _daily_limit_active(timeframe):
+        daily += " — INACTIVE sur ce timeframe (bougies >= 1 jour : elle n'a de sens qu'en intrajournalier)"
+    if not risk.allow_short:
+        short = "désactivée"
+    elif paper:
+        short = "autorisée (paper : simulation seulement ; refusée en réel, impossible au comptant)"
+    else:
+        short = "autorisée"
     rows = [
         ("Exchange", exchange_id),
         ("Symbole", symbol),
@@ -428,18 +516,67 @@ def _recap_lines(
             "Stratégie",
             f"{strategy.name} ({', '.join(f'{k}={v}' for k, v in strategy.params.items())})",
         ),
-        ("Capital de référence", f"{settings.initial_cash:,.2f}".replace(",", " ")),
+        (
+            "Capital de référence",
+            f"{cash:,.2f}".replace(",", " ")
+            + ("" if paper else " (indicatif : le solde réel vient de l'exchange)"),
+        ),
         ("Risque par trade", _fmt_fraction(risk.risk_per_trade)),
         ("Position maximale", _fmt_fraction(risk.max_position_fraction) + " du capital"),
+        (
+            "Stop de protection",
+            "toujours présent : stop de la stratégie s'il est du bon côté du prix, sinon "
+            f"{risk.default_stop_atr_mult:g} × ATR({DEFAULT_STOP_ATR_WINDOW}), sinon "
+            f"{_fmt_fraction(risk.default_stop_pct)} du prix ; taille = risque par trade",
+        ),
+        ("Ré-entrée après stop", REENTRY_LABELS.get(reentry, reentry)),
         ("Kill switch (drawdown)", _fmt_fraction(risk.max_drawdown)),
-        ("Limite de perte journalière", _fmt_fraction(risk.daily_loss_limit)),
-        ("Vente à découvert", "autorisée" if risk.allow_short else "désactivée"),
+        ("Limite de perte journalière", daily),
+        ("Vente à découvert", short),
         ("Notionnel minimal", f"{risk.min_trade_notional:g}"),
-        ("Fichiers d'état", str(state_dir)),
+        ("Fichiers d'état", f"{state_dir} (un seul robot à la fois : verrou « lock »)"),
         ("Mode", mode),
     ]
     width = max(len(label) for label, _ in rows)
     return [f"{label.ljust(width)} : {value}" for label, value in rows]
+
+
+#: largeur de la colonne des libellés du récapitulatif paper / live
+RECAP_LABEL_WIDTH = 27
+
+
+def _recap_row(label: str, value: str) -> str:
+    return f"  {label.ljust(RECAP_LABEL_WIDTH)} : {value}"
+
+
+def _existing_position_text(trader: LiveTrader) -> str:
+    """Valeur de la ligne « Position existante » du récapitulatif : l'actif de base déjà
+    présent sur le compte, et ce que le robot en fait.
+
+    Le robot ne reprend que la position qu'il a lui-même mémorisée (``position.json``) ;
+    un solde présent alors qu'il est plat n'est pris en charge qu'avec ``--adopt-position``.
+    """
+    base = trader.symbol.split("/")[0]
+    try:
+        held = trader.broker.get_position(trader.symbol)
+    except BrokerError as exc:
+        return f"inconnue ({exc})"
+    if not held.is_open:
+        return f"aucune ({base} absent du compte)"
+    amount = abs(held.amount)
+    record = trader.position
+    if record.is_open and record.side == held.side:
+        stop = f"{record.stop_loss:.6g}" if record.stop_loss is not None else "aucun"
+        return f"{amount:.8g} {base}, position du robot reprise de position.json (stop {stop})"
+    if trader.adopt_existing_position:
+        return (
+            f"{amount:.8g} {base} CONFIÉS au robot (--adopt-position) : il la gère sans stop "
+            "jusqu'au prochain stop de la stratégie"
+        )
+    return (
+        f"{amount:.8g} {base} NON gérés par le robot : il ne les vend pas, ne les protège pas "
+        "et n'ouvrira rien tant qu'ils sont là ; --adopt-position pour les lui confier"
+    )
 
 
 # ============================================================================ commandes
@@ -488,10 +625,17 @@ def cmd_download(args: argparse.Namespace) -> int:
     settings = _load_config(args)
     exchange_id, symbol, timeframe = _data_description(args, settings)
     cache_dir = args.cache_dir or DEFAULT_CACHE_DIR
+    path = cache_path(cache_dir, exchange_id, symbol, timeframe)
+    before = _cache_signature(path)
     _print(
-        f"Téléchargement de {symbol} {timeframe} sur {exchange_id} "
+        f"Bougies {symbol} {timeframe} sur {exchange_id} "
         f"(depuis {args.since or 'les bougies les plus récentes'}"
-        f"{', jusqu’à ' + args.until if args.until else ''})..."
+        f"{', jusqu’à ' + args.until if args.until else ''}) : "
+        + (
+            "cache existant, seul le complément manquant sera téléchargé..."
+            if before is not None and not args.refresh
+            else "téléchargement..."
+        )
     )
     kwargs: dict[str, Any] = {}
     if args.until:
@@ -511,12 +655,16 @@ def cmd_download(args: argparse.Namespace) -> int:
             f"Aucune bougie reçue pour {symbol} {timeframe} sur {exchange_id} : vérifiez le "
             "symbole (format BASE/QUOTE, ex. BTC/USDT), le timeframe et votre connexion."
         )
-    _print(f"{len(df)} bougies ({_period(df)})")
-    _print(f"Cache : {cache_path(cache_dir, exchange_id, symbol, timeframe)}")
+    _print(f"{len(df)} bougies ({_period(df)}) ; {_cache_status(path, before)}")
+    _print(f"Cache : {path}")
     if args.out:
         save_csv(df, args.out)
         _print(f"Copie : {args.out}")
-    _print("Astuce : --refresh force un nouveau téléchargement même si le cache existe.")
+    _print(
+        "Astuce : un cache qui couvre déjà la période demandée est réutilisé tel quel ; "
+        "--since / --until hors du cache ne téléchargent que le complément ; --refresh force "
+        "un téléchargement complet."
+    )
     return 0
 
 
@@ -656,6 +804,12 @@ def cmd_paper(args: argparse.Namespace) -> int:
     initial_cash = (
         float(args.initial_cash) if args.initial_cash is not None else settings.initial_cash
     )
+    if risk.config.allow_short:
+        logger.warning(
+            "Vente à découvert autorisée en paper : c'est une simulation. Au comptant (spot), "
+            "un exchange réel refuse de vendre ce qu'on ne détient pas : la commande live "
+            "refusera allow_short = true."
+        )
 
     exchange = build_public_exchange(exchange_id)
     broker = PaperBroker(
@@ -677,18 +831,29 @@ def cmd_paper(args: argparse.Namespace) -> int:
         lookback=_trading_lookback(args, strategy),
         notifier=_build_notifier(settings),
         allow_short=risk.config.allow_short,
+        adopt_existing_position=bool(getattr(args, "adopt_position", False)),
+        reentry_after_stop=REENTRY_POLICY,
     )
     _print("Paper trading (ARGENT FICTIF) : aucun ordre réel ne sera passé.")
     for line in _recap_lines(
-        settings, exchange_id, symbol, timeframe, strategy, risk.config, state_dir, sandbox=False
+        settings,
+        exchange_id,
+        symbol,
+        timeframe,
+        strategy,
+        risk.config,
+        state_dir,
+        sandbox=False,
+        initial_cash=initial_cash,
+        reentry=trader.reentry_after_stop,
+        paper=True,
     ):
         if not line.startswith("Mode"):
             _print("  " + line)
     _print(
-        f"  {'Compte fictif'.ljust(27)} : {broker_state} (cash {broker.cash:,.2f})".replace(
-            ",", " "
-        )
+        _recap_row("Compte fictif", f"{broker_state} (cash {broker.cash:,.2f})".replace(",", " "))
     )
+    _print(_recap_row("Position existante", _existing_position_text(trader)))
     return _run_trader(trader, args)
 
 
@@ -706,6 +871,14 @@ def _live_refusals(settings: Settings, args: argparse.Namespace) -> list[str]:
         missing.append(
             "les clés API sont absentes : renseignez TRADINGBOT_API_KEY et TRADINGBOT_API_SECRET "
             "dans .env (droits « trade » uniquement, JAMAIS le retrait)"
+        )
+    if settings.risk.allow_short or getattr(args, "allow_short", False):
+        missing.append(
+            "la vente à découvert est demandée (allow_short = true ou --allow-short) mais le "
+            "robot ne trade qu'au comptant (spot) : on ne peut pas vendre ce qu'on ne détient "
+            "pas, chaque signal short deviendrait un ordre refusé par l'exchange. Écrivez "
+            "allow_short = false dans config.toml (section [risk]) et n'utilisez pas "
+            "--allow-short (le paper trading peut encore le simuler)"
         )
     return missing
 
@@ -740,6 +913,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         risk.config,
         state_dir,
         bool(args.sandbox),
+        reentry=REENTRY_POLICY,
     ):
         _print("  " + line)
     _print()
@@ -778,6 +952,7 @@ def cmd_live(args: argparse.Namespace) -> int:
         notifier=_build_notifier(settings),
         allow_short=risk.config.allow_short,
         adopt_existing_position=bool(getattr(args, "adopt_position", False)),
+        reentry_after_stop=REENTRY_POLICY,
     )
     balance = broker.get_balance(symbol)
     _print(
@@ -785,6 +960,7 @@ def cmd_live(args: argparse.Namespace) -> int:
             ",", " "
         )
     )
+    _print(_recap_row("Position existante", _existing_position_text(trader)))
     return _run_trader(trader, args)
 
 
@@ -900,7 +1076,15 @@ def _add_trading_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--allow-short",
         action="store_true",
-        help="autorise la vente à découvert (si le risque l'autorise aussi)",
+        help="autorise la vente à découvert (simulation en paper ; refusée par live : spot)",
+    )
+    parser.add_argument(
+        "--adopt-position",
+        action="store_true",
+        help=(
+            "confie au robot l'actif déjà présent sur le compte alors qu'il est plat "
+            "(sinon il ne le vend pas, ne le protège pas et refuse d'ouvrir tant qu'il est là)"
+        ),
     )
 
 
@@ -1074,7 +1258,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(func(args))
     except KeyboardInterrupt:
         _eprint("Arrêt demandé (Ctrl-C).")
-        return 130
+        return EXIT_INTERRUPTED
+    except StateLockedError as exc:
+        _eprint(f"REFUS : {exc}")
+        return EXIT_REFUSED
     except CliError as exc:
         _eprint(f"Erreur : {exc}")
         return 1

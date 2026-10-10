@@ -372,9 +372,12 @@ walk_forward(df, strategy_cls, grid=None, train_bars=None, test_bars=None, confi
 @dataclass
 class WalkForwardResult:
     windows: list[dict]        # {window, train_start, train_end, test_start, test_end,
-                               #  best_params, is_metric, oos_metric, n_test_bars,
-                               #  n_oos_trades, oos_return, oos_kill_switch (bool)}
-                               # (bornes = indices de bougies)
+                               #  best_params, is_metric, oos_metric, train_start_time,
+                               #  train_end_time, test_start_time, test_end_time,
+                               #  n_test_bars, n_oos_trades, oos_return,
+                               #  oos_kill_switch (bool)}
+                               # (bornes = indices de bougies, fin EXCLUE ; *_time =
+                               #  Timestamps de la 1re et de la dernière bougie incluses)
     oos_equity: pd.Series      # équité OOS recomposée (chaînage des rendements)
     oos_metrics: dict          # dont buy_hold_return = buy & hold NET (règle 8 du moteur)
                                # de open[train_bars+1] à la dernière clôture
@@ -578,7 +581,9 @@ class StateLockedError(RuntimeError)   # message FR ; la CLI doit le mapper au c
   `LogNotifier(level=logging.INFO, logger_name=None)`, `MultiNotifier(notifiers)` (diffuse
   à plusieurs), `TelegramNotifier(token, chat_id, session=None, timeout=10.0)` (session
   type `requests` injectable, `urllib` par défaut, timeouts, jamais d'exception
-  propagée : une notification qui échoue ne doit pas arrêter le bot).
+  propagée : une notification qui échoue ne doit pas arrêter le bot). Le jeton **et** le
+  `chat_id` sont des secrets : aucun avertissement ne les journalise (le jeton est masqué
+  `***` dans les messages d'erreur qui le contiendraient) et `repr()` les masque.
 
 ## `tradingbot/config.py`
 
@@ -594,7 +599,14 @@ class Settings:  # miroir de config.example.toml, avec sous-dataclasses
 load_settings(path="config.toml", env=None) -> Settings   # TOML via tomllib ; valeurs
                                                           # manquantes = défauts ;
                                                           # lit `.env` (format KEY=VALUE)
-                                                          # puis os.environ (prioritaire)
+                                                          # puis os.environ (prioritaire).
+                                                          # [risk] : toutes les clés de
+                                                          # RiskConfig (dont default_stop_
+                                                          # atr_mult / default_stop_pct) lues
+                                                          # d'après les champs de la dataclass
+                                                          # (_from_table), puis bornes du
+                                                          # RiskManager vérifiées → ValueError
+                                                          # préfixée « [risk] » dès le chargement
 load_dotenv(path=".env") -> dict[str, str]                # sans dépendance externe
 parse_param_overrides(items) -> dict[str, Any]            # ["fast=10", "x=1.5"] → dict ;
                                                           # ValueError si format invalide
@@ -609,23 +621,43 @@ Toutes les sorties utilisateur en français, `argparse`, code de sortie ≠ 0 en
 | Commande | Rôle |
 |---|---|
 | `list-strategies` | nom, description et paramètres par défaut de chaque stratégie |
-| `demo [--bars 3000] [--seed 42] [--report-dir]` | backtest de toutes les stratégies sur données synthétiques, sans réseau (premier contact) |
+| `demo [--bars 3000] [--seed 42] [--initial-cash --fee --slippage --allow-short] [--report-dir]` | backtest de toutes les stratégies sur données synthétiques, sans réseau (premier contact) |
 | `download [--exchange --symbol --timeframe] [--since --until] [--out] [--cache-dir --refresh]` | télécharge et met en cache |
-| `backtest --strategy S (--data fichier.csv \| --exchange E --symbol X --timeframe T [--since]) [--param k=v ...] [--initial-cash --fee --slippage --allow-short] [--report-dir]` | backtest + rapport |
-| `compare (--data ... \| --exchange ...) [--strategies a,b] [--report-dir]` | toutes les stratégies vs buy & hold |
-| `optimize --strategy S ... [--train-bars --test-bars --metric --anchored --max-combinations] [--report-dir]` | walk-forward (fenêtres par défaut : `default_windows`) |
-| `paper [--strategy S --exchange --symbol --timeframe] [--once] [--poll] [--lookback --state-dir --max-iterations] [--initial-cash --fee --slippage]` | paper trading temps réel sur données publiques |
-| `live ... --i-understand-the-risks [--yes] [--sandbox]` | trading réel ; exige `mode = "live"` dans config.toml, le flag, et les clés dans `.env` ; affiche un récapitulatif et demande de taper `OUI` |
+| `backtest --strategy S (--data fichier.csv \| --exchange E --symbol X --timeframe T [--since] [--cache-dir --refresh]) [--param k=v ...] [--initial-cash --fee --slippage --allow-short] [--report-dir]` | backtest + rapport |
+| `compare (--data ... \| --exchange ...) [--strategies a,b] [--initial-cash --fee --slippage --allow-short] [--report-dir]` | toutes les stratégies vs buy & hold (mêmes options de données que `backtest`) |
+| `optimize --strategy S ... [--param k=v ...] [--train-bars --test-bars --metric --anchored --max-combinations] [--report-dir]` | walk-forward (fenêtres par défaut : `default_windows` ; mêmes options de données et de coûts que `backtest`) |
+| `paper [--strategy S --exchange --symbol --timeframe] [--once] [--poll] [--lookback --state-dir --max-iterations] [--allow-short] [--adopt-position] [--initial-cash --fee --slippage]` | paper trading temps réel sur données publiques |
+| `live ... --i-understand-the-risks [--yes] [--sandbox] [--adopt-position]` | trading réel ; exige `mode = "live"` dans config.toml, le flag, et les clés dans `.env` ; refuse `allow_short = true` / `--allow-short` (spot) ; affiche un récapitulatif et demande de taper `OUI` |
 
-Options communes : `--config` (défaut `config.toml`, facultatif : valeurs par défaut s'il
-n'existe pas) et `--log-level`. `--exchange/--symbol/--timeframe/--strategy` retombent sur
+Options communes à toutes les commandes : `--config` (défaut `config.toml`, facultatif :
+valeurs par défaut s'il n'existe pas) et `--log-level`. `--exchange/--symbol/--timeframe/--strategy` retombent sur
 `config.toml` quand ils sont omis ; `--param` accepte `k=v` avec conversion automatique
 int/float/bool et surcharge `[strategy.params]`.
 
 Codes de sortie : `0` succès, `1` erreur (fichier introuvable, stratégie inconnue,
-`BrokerError`…), `2` refus de sécurité de `live` ou arguments invalides, `130` Ctrl-C.
-Journalisation du paquet sur stderr (niveau par défaut `warning` hors ligne, `info` pour
-`download`/`paper`/`live`) ; hors ligne, un message identique n'est affiché qu'une fois.
+`BrokerError`, itération `--once` terminée en action `error`…), `2` refus de sécurité de
+`live` (dont `allow_short`), arguments invalides ou répertoire d'état déjà verrouillé
+(`StateLockedError`), `130` Ctrl-C (`LiveTrader.run` relance `KeyboardInterrupt` après son
+nettoyage ; `main` la mappe). Journalisation du paquet sur stderr (niveau par défaut
+`warning` hors ligne, `info` pour `download`/`paper`/`live`) ; hors ligne, un message
+identique n'est affiché qu'une fois. L'identifiant de chat Telegram (secret) n'est jamais
+journalisé.
+
+Récapitulatif `paper` / `live` (avant tout trading) : exchange, symbole, timeframe,
+stratégie et paramètres, capital de référence **effectif** (`--initial-cash` prime ;
+« indicatif » en live), risque par trade, position maximale, **stop de protection** (règle
+de précédence de `RiskManager.protective_stop` avec les valeurs de `[risk]`), **ré-entrée
+après stop** (`REENTRY_POLICY = "wait"`, libellé `report.REENTRY_LABELS`), kill switch,
+**limite journalière** (suffixe « INACTIVE sur ce timeframe » si la bougie fait >= 1 jour,
+même règle que `LiveTrader`), vente à découvert (« simulation seulement » en paper),
+notionnel minimal, fichiers d'état (et verrou), compte fictif (paper) et **position
+existante** sur le compte (aucune / reprise de `position.json` / confiée au robot via
+`--adopt-position` / NON gérée). `--once` libère le verrou (`trader.close()`) avant de
+rendre la main.
+
+`download` / `_load_data` disent ce que `load_or_fetch` a fait du cache (comparaison de
+l'empreinte mtime/taille du fichier avant/après) : « téléchargées et mises en cache »,
+« cache réutilisé tel quel, aucun téléchargement », « cache complété / mis à jour ».
 
 Fichiers d'état : boucle `<state_dir>/<paper|sandbox|live>/<exchange>_<symbole>_<timeframe>/`
 (`last_bar.json`, `position.json`, `risk.json`, `lock`), afin que paper, testnet et réel

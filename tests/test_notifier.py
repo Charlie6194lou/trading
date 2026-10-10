@@ -206,12 +206,38 @@ def test_telegram_requires_positive_timeout() -> None:
         TelegramNotifier(TOKEN, CHAT, session=FakeSession(), timeout=0)
 
 
-def test_telegram_repr_hides_token() -> None:
+def test_telegram_repr_hides_token_and_chat_id() -> None:
+    # F29 : le chat_id est un secret au même titre que le jeton (avec le jeton, il permet
+    # d'écrire dans la conversation) : ni l'un ni l'autre n'apparaissent dans repr().
     n = TelegramNotifier(TOKEN, CHAT, session=FakeSession())
     text = repr(n)
     assert TOKEN not in text
     assert "***" in text
-    assert CHAT in text
+    assert CHAT not in text
+    assert text.startswith("TelegramNotifier(")
+
+
+def test_telegram_failure_warnings_never_log_the_chat_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # F29 : échec réseau -> avertissement sans chat_id ni jeton.
+    session = FakeSession(raise_exc=ConnectionError(f"échec vers {EXPECTED_URL}"))
+    n = TelegramNotifier(TOKEN, CHAT, session=session)
+    with caplog.at_level(logging.WARNING, logger="tradingbot.live.notifier"):
+        assert n.send("bonjour") is False
+    assert "Notification Telegram impossible" in caplog.text
+    assert CHAT not in caplog.text and TOKEN not in caplog.text
+
+    # Réponse exotique (statut non numérique -> int() lève dans _check_response) : le second
+    # avertissement ne révèle pas davantage le chat_id.
+    caplog.clear()
+    weird = FakeResponse(200)
+    weird.status_code = "deux cents"  # type: ignore[assignment]
+    n2 = TelegramNotifier(TOKEN, CHAT, session=FakeSession(response=weird))
+    with caplog.at_level(logging.WARNING, logger="tradingbot.live.notifier"):
+        assert n2.send("bonjour") is False
+    assert "Réponse Telegram illisible" in caplog.text
+    assert CHAT not in caplog.text and TOKEN not in caplog.text
 
 
 def test_telegram_default_session_is_urllib_without_network_call() -> None:

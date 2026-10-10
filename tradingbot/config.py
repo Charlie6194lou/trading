@@ -414,6 +414,18 @@ def _validate_initial_cash(value: float) -> None:
         )
 
 
+def _validate_risk(risk: RiskConfig) -> None:
+    """Les bornes de ``[risk]`` (dont ``default_stop_atr_mult`` et ``default_stop_pct``) sont
+    celles du :class:`~tradingbot.risk.RiskManager` : on les vérifie dès le chargement pour
+    que l'erreur nomme la section plutôt que d'éclater au premier trade."""
+    from tradingbot.risk import RiskManager
+
+    try:
+        RiskManager(risk)
+    except ValueError as exc:
+        raise ValueError(f"[risk] {exc}") from None
+
+
 def _secret(env: Mapping[str, str], name: str) -> str | None:
     """Valeur de la variable ``name`` ; ``None`` si absente ou vide."""
     value = env.get(name)
@@ -451,6 +463,10 @@ def load_settings(
     - fichier absent : défauts identiques à ``config.example.toml`` (journalisé en info) ;
     - sections ou clés inconnues : avertissement, jamais d'erreur ;
     - ``mode`` hors de ``{"paper", "live"}`` ou ``timeframe`` mal formé : ``ValueError`` ;
+    - ``[risk]`` : toutes les clés de :class:`~tradingbot.risk.RiskConfig` (dont
+      ``default_stop_atr_mult`` et ``default_stop_pct``) sont lues d'après les champs de la
+      dataclass et vérifiées avec les bornes du ``RiskManager`` (``ValueError`` préfixée
+      ``[risk]``) ;
     - ``env`` : dictionnaire de variables d'environnement à utiliser tel quel (tests, CLI).
       S'il vaut ``None``, on lit ``.env`` (à côté du fichier de configuration, sinon dans le
       répertoire courant) puis ``os.environ``, ce dernier étant prioritaire.
@@ -478,6 +494,7 @@ def load_settings(
     )
     _validate_initial_cash(initial_cash)
     risk = _from_table("risk", risk_table, _risk_config_cls())
+    _validate_risk(risk)
 
     costs = _from_table("costs", _table(raw, "costs"), CostSettings)
     _validate_fraction("costs", "fee_rate", costs.fee_rate)

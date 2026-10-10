@@ -131,7 +131,9 @@ class TelegramNotifier(Notifier):
     - ``timeout`` : délai maximal en secondes pour la requête HTTP.
 
     Toute exception (réseau, délai dépassé, réponse illisible) est attrapée :
-    :meth:`send` renvoie ``False`` et un avertissement est journalisé, sans le jeton.
+    :meth:`send` renvoie ``False`` et un avertissement est journalisé, **sans le jeton ni
+    l'identifiant de chat** (tous deux secrets : avec le jeton, le chat_id permet d'écrire
+    dans la conversation ; ``repr`` les masque aussi).
     """
 
     def __init__(
@@ -198,8 +200,7 @@ class TelegramNotifier(Notifier):
             )
         except Exception as exc:
             logger.warning(
-                "Notification Telegram impossible (chat %s) : %s: %s",
-                self.chat_id,
+                "Notification Telegram impossible : %s: %s",
                 type(exc).__name__,
                 self._mask(str(exc)),
             )
@@ -207,14 +208,12 @@ class TelegramNotifier(Notifier):
         try:
             return self._check_response(resp)
         except Exception as exc:  # réponse exotique : on ne propage jamais
-            logger.warning(
-                "Réponse Telegram illisible (chat %s) : %s", self.chat_id, self._mask(str(exc))
-            )
+            logger.warning("Réponse Telegram illisible : %s", self._mask(str(exc)))
             return False
 
     def __repr__(self) -> str:
         tail = self._token[-4:] if len(self._token) > 4 else ""
-        return f"TelegramNotifier(chat_id={self.chat_id!r}, token='{_MASK}{tail}')"
+        return f"TelegramNotifier(chat_id='{_MASK}', token='{_MASK}{tail}')"
 
 
 class MultiNotifier(Notifier):
